@@ -18,6 +18,7 @@ from music_assistant.helpers.audio import get_mime_type
 from music_assistant.helpers.util import is_port_in_use
 from music_assistant.models.player_provider import PlayerProvider
 
+from .cli_commands import map_transport_command
 from .constants import (
     CONF_CLI_JSON_PORT,
     CONF_CLI_TELNET_PORT,
@@ -27,6 +28,7 @@ from .constants import (
 from .player import SqueezelitePlayer
 
 if TYPE_CHECKING:
+    from aioslimproto.cli import SlimCLICommand
     from aioslimproto.client import SlimClient
 
 
@@ -88,7 +90,40 @@ class SqueezelitePlayerProvider(PlayerProvider):
             ip_address=self.mass.streams.publish_ip,
             name="Music Assistant",
             control_port=control_port,
+            cli_command_handler=self._handle_cli_command,
         )
+
+    async def _handle_cli_command(self, cmd: SlimCLICommand) -> None:
+        """
+        Handle a legacy SlimProto CLI command from a player.
+
+        Only transport commands are handled here, so that a control on a synced
+        player is applied to the whole sync group (the player controller redirects
+        a synced player to its sync leader). Any other command raises
+        NotImplementedError so aioslimproto's built-in handlers and the CLI event
+        path stay in charge.
+
+        :param cmd: The CLI command received from the player.
+        """
+        if not cmd.player_id:
+            raise NotImplementedError
+        action = map_transport_command(cmd.command, list(cmd.args))
+        if action is None:
+            raise NotImplementedError
+        self.logger.log(VERBOSE_LOG_LEVEL, "CLI transport command: %s -> %s", cmd.command, action)
+        players = self.mass.players
+        if action == "play":
+            await players.cmd_play(cmd.player_id)
+        elif action == "pause":
+            await players.cmd_pause(cmd.player_id)
+        elif action == "play_pause":
+            await players.cmd_play_pause(cmd.player_id)
+        elif action == "stop":
+            await players.cmd_stop(cmd.player_id)
+        elif action == "next":
+            await players.cmd_next_track(cmd.player_id)
+        elif action == "previous":
+            await players.cmd_previous_track(cmd.player_id)
 
     async def loaded_in_mass(self) -> None:
         """Call after the provider has been loaded."""
