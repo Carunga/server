@@ -4,7 +4,7 @@ SqueezePlay menu handler that exposes the Music Assistant library on the player.
 SqueezePlay (Radio/Touch/Boom) builds its home menu from the server's ``menu``
 CLI response and browses lists by issuing the ``go`` command of the selected
 item. This module answers those commands so the library (playlists, artists,
-suggestions) shows up under "My Music" and is directly playable.
+discover) shows up under "My Music" and is directly playable.
 
 The handler is injected into aioslimproto via ``cli_command_handler`` and only
 handles its own commands; everything else raises ``NotImplementedError`` so the
@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from music_assistant_models.enums import QueueOption
+from music_assistant_models.enums import MediaType, QueueOption
 from music_assistant_models.errors import MusicAssistantError
 
 if TYPE_CHECKING:
@@ -26,19 +26,22 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger(__name__)
 
-# items are placed under the local "My Music" node
+# library entries are placed under the local "My Music" node
 HOME_NODE = "myMusic"
+# the root of the home menu, for entries that must not live under My Music
+ROOT_NODE = "home"
 # presets use weight 35; lower weights sort above them
-HOME_ENTRIES: tuple[tuple[str, str, int, str], ...] = (
-    ("ma_playlists", "Playlists", 20, "playlists"),
-    ("ma_artists", "Artists", 21, "artists"),
-    ("ma_suggestions", "Suggestions", 22, "suggestions"),
+HOME_ENTRIES: tuple[tuple[str, str, str, int, str], ...] = (
+    ("ma_playlists", "Playlists", HOME_NODE, 20, "playlists"),
+    ("ma_artists", "Artists", HOME_NODE, 21, "artists"),
+    ("ma_discover", "Discover", HOME_NODE, 22, "recommendations"),
 )
-# only added when the Home Assistant plugin is available
-HA_SCRIPTS_ENTRY: tuple[str, str, int, str] = (
+# only added when the Home Assistant plugin is available; lives at the root
+HA_SCRIPTS_ENTRY: tuple[str, str, str, int | None, str] = (
     "ma_ha_scripts",
     "HA scripts",
-    23,
+    ROOT_NODE,
+    None,
     "ha_scripts",
 )
 # Home Assistant label whose scripts are listed in the HA scripts menu
@@ -96,16 +99,16 @@ class SqueezeliteLibraryMenu:
         return result
 
     def _home_entries(self) -> list[dict[str, Any]]:
-        """Build the library entries shown directly under My Music."""
+        """Build the library entries and the root-level Home Assistant entry."""
         entries = list(HOME_ENTRIES)
         if self.mass.get_provider("hass") is not None:
             entries.append(HA_SCRIPTS_ENTRY)
-        return [
-            {
+        items: list[dict[str, Any]] = []
+        for entry_id, text, node, weight, view in entries:
+            item: dict[str, Any] = {
                 "id": entry_id,
-                "node": HOME_NODE,
+                "node": node,
                 "text": text,
-                "weight": weight,
                 "actions": {
                     "go": {
                         "player": 0,
@@ -114,8 +117,10 @@ class SqueezeliteLibraryMenu:
                     }
                 },
             }
-            for entry_id, text, weight, view in entries
-        ]
+            if weight is not None:
+                item["weight"] = weight
+            items.append(item)
+        return items
 
     # ------------------------------------------------------------------
     # browsing
@@ -135,9 +140,13 @@ class SqueezeliteLibraryMenu:
         """Dispatch a browse view to the matching library query."""
         try:
             if view == "playlists":
-                return await self._playlist_items(dynamic_only=False)
-            if view == "suggestions":
-                return await self._playlist_items(dynamic_only=True)
+                return await self._playlist_items()
+            if view == "recommendations":
+                return await self._recommendation_folders()
+            if view == "recommendation_items":
+                return await self._recommendation_items(
+                    str(params.get("provider") or ""), str(params.get("item_id") or "")
+                )
             if view == "artists":
                 return await self._artist_items()
             if view == "albums":
@@ -150,21 +159,69 @@ class SqueezeliteLibraryMenu:
             LOGGER.exception("Error building browse view %s", view)
         return []
 
-    async def _playlist_items(self, dynamic_only: bool) -> list[dict[str, Any]]:
-        """Return library playlists (optionally only generated/dynamic ones)."""
-        suggestions: list[dict[str, Any]] = []
-        all_playlists: list[dict[str, Any]] = []
+    async def _playlist_items(self) -> list[dict[str, Any]]:
+        """Return library playlists."""
+        items: list[dict[str, Any]] = []
         async for playlist in self.mass.music.playlists.iter_library_items():
-            item = self._playable_item(playlist.name, playlist.uri)
-            all_playlists.append(item)
-            if getattr(playlist, "is_dynamic", False):
-                suggestions.append(item)
-            if len(all_playlists) >= MAX_ITEMS:
+            items.append(self._playable_item(playlist.name, playlist.uri))
+            if len(items) >= MAX_ITEMS:
                 break
-        if not dynamic_only:
-            return all_playlists
-        # fall back to all playlists if we found no generated ones
-        return suggestions or all_playlists
+        return items
+
+    async def _recommendation_folders(self) -> list[dict[str, Any]]:
+        """
+        Return the recommendation rows (library rows plus streaming providers).
+
+        The recommendations subcontroller aggregates every provider that declares
+        the RECOMMENDATIONS feature, so no provider is hardcoded here.
+        """
+        folders = await self.mass.music.recommendations.get_recommendations()
+        items: list[dict[str, Any]] = []
+        for folder in folders:
+            # rows off by default are noisier and hidden in the MA UI until opted in
+            if getattr(folder, "enabled_by_default", True) is False:
+                continue
+            items.append(
+                {
+                    "id": f"rec-{folder.provider}-{folder.item_id}",
+                    "node": HOME_NODE,
+                    "text": folder.name,
+                    "actions": {
+                        "go": {
+                            "player": 0,
+                            "cmd": ["ma_browse"],
+                            "params": {
+                                "view": "recommendation_items",
+                                "provider": str(folder.provider),
+                                "item_id": str(folder.item_id),
+                            },
+                        }
+                    },
+                }
+            )
+            if len(items) >= MAX_ITEMS:
+                break
+        return items
+
+    async def _recommendation_items(self, provider: str, item_id: str) -> list[dict[str, Any]]:
+        """Return the playable items of a single recommendation row."""
+        if not provider or not item_id:
+            return []
+        row_items = await self.mass.music.recommendations.get_recommendation_items(
+            provider, item_id
+        )
+        items: list[dict[str, Any]] = []
+        for row_item in row_items:
+            if getattr(row_item, "media_type", None) == MediaType.FOLDER:
+                # a folder row: list its nested items so it is not a dead end
+                for child in getattr(row_item, "items", None) or []:
+                    if uri := getattr(child, "uri", None):
+                        items.append(self._playable_item(child.name, uri))
+            elif uri := getattr(row_item, "uri", None):
+                items.append(self._playable_item(row_item.name, uri))
+            if len(items) >= MAX_ITEMS:
+                break
+        return items
 
     async def _artist_items(self) -> list[dict[str, Any]]:
         """Return library artists; selecting one opens its albums."""
@@ -266,10 +323,11 @@ class SqueezeliteLibraryMenu:
         if not entity_ids:
             return []
         names = await self._friendly_names(hass, entity_ids)
-        return [
-            self._run_script_item(names.get(entity_id) or entity_id, entity_id)
-            for entity_id in entity_ids
-        ]
+        rows = sorted(
+            ((names.get(entity_id) or entity_id, entity_id) for entity_id in entity_ids),
+            key=lambda row: row[0].casefold(),
+        )
+        return [self._run_script_item(name, entity_id) for name, entity_id in rows]
 
     async def _label_ids(self, hass: Any) -> set[str]:
         """Return the label ids whose name matches the configured label."""
