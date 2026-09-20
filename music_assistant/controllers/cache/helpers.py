@@ -45,6 +45,11 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 
+def _is_empty_collection(value: Any) -> bool:
+    """Return whether a cached value is an empty collection (list/tuple/set/dict)."""
+    return isinstance(value, (list, tuple, set, frozenset, dict)) and not value
+
+
 def use_cache(
     expiration: int = DEFAULT_CACHE_EXPIRATION,
     category: int = 0,
@@ -135,7 +140,11 @@ def use_cache(
                     allow_expired_cache=allow_expired_cache,
                 )
 
-            if cache_hit and allow_expired_cache:
+            # an expired *empty* collection is not useful stale data: serving it would
+            # e.g. resolve a playlist to nothing and fail playback. Fall through to a
+            # synchronous fetch instead, so the caller gets a real (fresh) result.
+            serve_stale = cache_hit and allow_expired_cache and not _is_empty_collection(cachedata)
+            if serve_stale:
                 # serve stale data and refresh in the background;
                 # task_id deduplicates concurrent refreshes for the same entry
                 async def _background_refresh() -> None:
