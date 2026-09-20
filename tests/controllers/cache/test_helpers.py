@@ -65,6 +65,13 @@ class _FakeProvider:
         """Return the preset result, counting invocations."""
         return await self._result()
 
+    @use_cache(3600, allow_expired_cache=True)
+    async def fetch_swr_items(self, item_id: str) -> list[dict[str, Any]]:
+        """Return a freshly built list, counting invocations."""
+        self.calls += 1
+        await self.gate.wait()
+        return [{"id": item_id}]
+
     @use_cache(3600)
     async def fetch_items(self, item_id: str) -> list[dict[str, Any]]:
         """Return a freshly built mutable payload, counting invocations."""
@@ -233,6 +240,31 @@ async def test_swr_serves_stale_and_refreshes(
     assert provider.calls == 1
     assert await provider.fetch_swr("a") == "fresh"
     assert provider.calls == 1
+
+
+async def test_swr_empty_collection_is_fetched_synchronously(
+    cache_controller: CacheController, provider: _FakeProvider
+) -> None:
+    """Test that an expired empty collection is fetched instead of served stale."""
+    await cache_controller.set(
+        "fetch_swr_items.a", [], provider=_PROVIDER, expiration=-1, allow_expired_cache=True
+    )
+    assert await provider.fetch_swr_items("a") == [{"id": "a"}]
+    assert provider.calls == 1
+
+
+async def test_swr_non_empty_collection_is_still_served_stale(
+    cache_controller: CacheController, provider: _FakeProvider
+) -> None:
+    """Test that an expired non-empty collection is still served stale."""
+    await cache_controller.set(
+        "fetch_swr_items.b",
+        [{"id": "stale"}],
+        provider=_PROVIDER,
+        expiration=-1,
+        allow_expired_cache=True,
+    )
+    assert await provider.fetch_swr_items("b") == [{"id": "stale"}]
 
 
 async def test_wrapper_performs_single_row_fetch(
