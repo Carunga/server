@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from aiohttp import web
 from aioslimproto.models import EventType as SlimEventType
@@ -25,6 +25,7 @@ from .constants import (
     CONF_DISCOVERY,
     DEFAULT_SLIMPROTO_PORT,
 )
+from .library_menu import SqueezeliteLibraryMenu
 from .player import SqueezelitePlayer
 
 if TYPE_CHECKING:
@@ -82,6 +83,9 @@ class SqueezelitePlayerProvider(PlayerProvider):
         # Validate ALL required ports before starting ANY services
         await self._validate_all_ports(control_port, telnet_port, json_port)
 
+        # handler for library menu commands from SqueezePlay devices
+        self._library_menu = SqueezeliteLibraryMenu(self)
+
         # create the server here (also validates config and sets up the CLI) but defer
         # start() to loaded_in_mass, so we subscribe to events before accepting clients
         self.slimproto = SlimServer(
@@ -93,20 +97,23 @@ class SqueezelitePlayerProvider(PlayerProvider):
             cli_command_handler=self._handle_cli_command,
         )
 
-    async def _handle_cli_command(self, cmd: SlimCLICommand) -> None:
+    async def _handle_cli_command(self, cmd: SlimCLICommand) -> Any:
         """
         Handle a legacy SlimProto CLI command from a player.
 
-        Only transport commands are handled here, so that a control on a synced
-        player is applied to the whole sync group (the player controller redirects
-        a synced player to its sync leader). Any other command raises
-        NotImplementedError so aioslimproto's built-in handlers and the CLI event
-        path stay in charge.
+        Library menu commands (home menu, browsing, playlist actions) are handled
+        by the library menu handler. Transport commands are mapped so that a
+        control on a synced player is applied to the whole sync group (the player
+        controller redirects a synced player to its sync leader). Any other
+        command raises NotImplementedError so aioslimproto's built-in handlers
+        and the CLI event path stay in charge.
 
         :param cmd: The CLI command received from the player.
         """
         if not cmd.player_id:
             raise NotImplementedError
+        if cmd.command in ("menu", "ma_browse", "playlistcontrol", "ma_run_script"):
+            return await self._library_menu.handle(cmd)
         action = map_transport_command(cmd.command, list(cmd.args))
         if action is None:
             raise NotImplementedError
