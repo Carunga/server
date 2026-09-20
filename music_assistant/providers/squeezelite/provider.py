@@ -22,9 +22,11 @@ from .constants import (
     CONF_CLI_JSON_PORT,
     CONF_CLI_TELNET_PORT,
     CONF_DISCOVERY,
+    CONF_SENDSPIN_BRIDGE,
     DEFAULT_SLIMPROTO_PORT,
 )
 from .player import SqueezelitePlayer
+from .sendspin_bridge import SendspinBridgeManager
 
 if TYPE_CHECKING:
     from aioslimproto.client import SlimClient
@@ -62,6 +64,12 @@ class SqueezelitePlayerProvider(PlayerProvider):
                 type=ConfigEntryType.INTEGER,
                 default_value=DEFAULT_SLIMPROTO_PORT,
             ),
+            ConfigEntry(
+                key=CONF_SENDSPIN_BRIDGE,
+                type=ConfigEntryType.BOOLEAN,
+                default_value=False,
+                advanced=True,
+            ),
         )
 
     async def handle_async_init(self) -> None:
@@ -90,6 +98,10 @@ class SqueezelitePlayerProvider(PlayerProvider):
             control_port=control_port,
         )
 
+        # Reconciles the Sendspin bridges for this provider's players (gated by
+        # the sendspin_bridge config option; a no-op while it is disabled).
+        self._bridge_manager = SendspinBridgeManager(self)
+
     async def loaded_in_mass(self) -> None:
         """Call after the provider has been loaded."""
         await super().loaded_in_mass()
@@ -116,6 +128,9 @@ class SqueezelitePlayerProvider(PlayerProvider):
 
     async def unload(self, is_removed: bool = False) -> None:
         """Handle unload/close of the provider."""
+        # Stop all Sendspin bridges before the server goes away
+        if bridge_manager := getattr(self, "_bridge_manager", None):
+            await bridge_manager.close()
         # Ensure complete cleanup
         await self._cleanup_server()
         self.mass.streams.unregister_dynamic_route("/slimproto/multi")
@@ -164,6 +179,11 @@ class SqueezelitePlayerProvider(PlayerProvider):
             finally:
                 self.slimproto = None
 
+    async def _setup_player(self, player: SqueezelitePlayer) -> None:
+        """Set up a newly connected player and reconcile its Sendspin bridge."""
+        await player.setup()
+        await self._bridge_manager.evaluate_bridge(player)
+
     def _handle_slimproto_event(
         self,
         event: SlimEvent,
@@ -179,7 +199,7 @@ class SqueezelitePlayerProvider(PlayerProvider):
             if not slimclient:
                 return  # should not happen, but guard anyways
             player = SqueezelitePlayer(self, event.player_id, slimclient)
-            self.mass.create_task(player.setup())
+            self.mass.create_task(self._setup_player(player))
             return
 
         if not (mass_player := self.mass.players.get_player(event.player_id)):
