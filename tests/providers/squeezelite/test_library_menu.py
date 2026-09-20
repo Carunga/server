@@ -22,6 +22,7 @@ def _make_menu(play_media: Any = None, hass: Any = None) -> SqueezeliteLibraryMe
     mass = types.SimpleNamespace(
         player_queues=types.SimpleNamespace(play_media=play_media or AsyncMock()),
         get_provider=lambda _domain: hass,
+        streams=types.SimpleNamespace(base_url="http://192.0.2.10:8098"),
     )
     provider = types.SimpleNamespace(mass=mass, logger=MagicMock())
     return SqueezeliteLibraryMenu(provider)
@@ -115,7 +116,8 @@ def test_home_entries_place_ha_scripts_at_root() -> None:
     assert items["ma_discover"]["node"] == HOME_NODE
     assert items["ma_discover"]["text"] == "Discover"
     assert items["ma_ha_scripts"]["node"] == ROOT_NODE
-    assert "weight" not in items["ma_ha_scripts"]
+    assert items["ma_ha_scripts"]["weight"] == 15
+    assert items["ma_ha_scripts"]["icon"] == "http://192.0.2.10:8098/slimproto/ha_icon.png"
 
 
 def test_home_entries_omit_ha_scripts_without_hass() -> None:

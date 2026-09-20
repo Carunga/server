@@ -36,12 +36,13 @@ HOME_ENTRIES: tuple[tuple[str, str, str, int, str], ...] = (
     ("ma_artists", "Artists", HOME_NODE, 21, "artists"),
     ("ma_discover", "Discover", HOME_NODE, 22, "recommendations"),
 )
-# only added when the Home Assistant plugin is available; lives at the root
-HA_SCRIPTS_ENTRY: tuple[str, str, str, int | None, str] = (
+# only added when the Home Assistant plugin is available; lives at the root,
+# below the built-in My Music node (weight 11) and above Radio (weight 20)
+HA_SCRIPTS_ENTRY: tuple[str, str, str, int, str] = (
     "ma_ha_scripts",
     "HA scripts",
     ROOT_NODE,
-    None,
+    15,
     "ha_scripts",
 )
 # Home Assistant label whose scripts are listed in the HA scripts menu
@@ -119,6 +120,8 @@ class SqueezeliteLibraryMenu:
             }
             if weight is not None:
                 item["weight"] = weight
+            if entry_id == HA_SCRIPTS_ENTRY[0]:
+                item["icon"] = f"{self.mass.streams.base_url}/slimproto/ha_icon.png"
             items.append(item)
         return items
 
