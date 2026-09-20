@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from aiohttp import web
@@ -31,6 +32,9 @@ from .player import SqueezelitePlayer
 if TYPE_CHECKING:
     from aioslimproto.cli import SlimCLICommand
     from aioslimproto.client import SlimClient
+
+# white on transparent logo served for the Home Assistant home-menu entry
+HA_LOGO_PATH = Path(__file__).parent / "ha_logo.png"
 
 
 class SqueezelitePlayerProvider(PlayerProvider):
@@ -131,6 +135,7 @@ class SqueezelitePlayerProvider(PlayerProvider):
             await players.cmd_next_track(cmd.player_id)
         elif action == "previous":
             await players.cmd_previous_track(cmd.player_id)
+        return None
 
     async def loaded_in_mass(self) -> None:
         """Call after the provider has been loaded."""
@@ -148,6 +153,7 @@ class SqueezelitePlayerProvider(PlayerProvider):
         self.mass.streams.register_dynamic_route(
             "/slimproto/multi", self._serve_multi_client_stream
         )
+        self.mass.streams.register_dynamic_route("/slimproto/ha_icon.png", self._serve_ha_icon)
         # it seems that WiiM devices do not use the json rpc port that is broadcasted
         # in the discovery info but instead they just assume that the jsonrpc endpoint
         # lives on the same server as stream URL. So we need to provide a jsonrpc.js
@@ -161,6 +167,7 @@ class SqueezelitePlayerProvider(PlayerProvider):
         # Ensure complete cleanup
         await self._cleanup_server()
         self.mass.streams.unregister_dynamic_route("/slimproto/multi")
+        self.mass.streams.unregister_dynamic_route("/slimproto/ha_icon.png")
         self.mass.streams.unregister_dynamic_route("/jsonrpc.js")
 
     def get_corrected_elapsed_milliseconds(self, slimplayer: SlimClient) -> int:
@@ -235,6 +242,10 @@ class SqueezelitePlayerProvider(PlayerProvider):
 
         # forward all other events to the player itself
         player.handle_slim_event(event)
+
+    async def _serve_ha_icon(self, request: web.Request) -> web.StreamResponse:
+        """Serve the Home Assistant logo used by the HA scripts home-menu entry."""
+        return web.FileResponse(HA_LOGO_PATH)
 
     async def _serve_multi_client_stream(self, request: web.Request) -> web.StreamResponse:
         """Serve the multi-client flow stream audio to a player."""
