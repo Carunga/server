@@ -70,6 +70,8 @@ class SqueezeliteLibraryMenu:
             return await self._handle_browse(cmd)
         if cmd.command == "ma_contextmenu":
             return await self._handle_contextmenu(cmd)
+        if cmd.command == "contextmenu":
+            return await self._handle_contextmenu_command(cmd)
         if cmd.command == "playlistcontrol":
             await self._handle_playlistcontrol(cmd)
             return None
@@ -316,8 +318,13 @@ class SqueezeliteLibraryMenu:
             return None
         total = int(queue.items or 0)
         current = int(queue.current_index or 0)
-        start = current if offset == "-" else int(offset)
-        start = max(0, min(start, max(total - 1, 0)))
+        if offset == "-":
+            # Now-playing status: keep aioslimproto's built-in (rich) item_loop for the
+            # current/next track. Replacing it with bare queue rows breaks the Now
+            # Playing screen (it needs track/artist/album fields); only report the real
+            # queue size and position so the queue shortcut stays in sync.
+            return {"playlist_tracks": total, "playlist_cur_index": current}
+        start = max(0, min(int(offset), max(total - 1, 0)))
         page = self.mass.player_queues.items(queue.queue_id, limit, start)
         items: list[dict[str, Any]] = []
         for page_index, queue_item in enumerate(page):
@@ -482,13 +489,27 @@ class SqueezeliteLibraryMenu:
 
     async def _handle_contextmenu(self, cmd: SlimCLICommand) -> dict[str, Any]:
         """Return the context menu (play now / add to queue / play next) for a uri."""
-        uri = cmd.kwargs.get("uri")
+        return self._context_menu(str(cmd.kwargs.get("uri") or ""))
+
+    async def _handle_contextmenu_command(self, cmd: SlimCLICommand) -> dict[str, Any]:
+        """Handle the built-in `contextmenu` command (e.g. from the playlist window)."""
+        uri = str(cmd.kwargs.get("uri") or "")
+        if (
+            not uri
+            and cmd.player_id
+            and (raw_index := cmd.kwargs.get("playlist_index")) is not None
+        ):
+            uri = await self._queue_item_uri(cmd.player_id, int(raw_index)) or ""
+        return self._context_menu(uri)
+
+    def _context_menu(self, uri: str) -> dict[str, Any]:
+        """Build the play/add/next context menu for a media uri."""
         items: list[dict[str, Any]] = []
         if uri:
             items = [
                 {
                     "text": text,
-                    "actions": {"do": self._play_action(str(uri), mode)},
+                    "actions": {"do": self._play_action(uri, mode)},
                 }
                 for text, mode in (
                     ("Play now", "play"),
@@ -497,6 +518,16 @@ class SqueezeliteLibraryMenu:
                 )
             ]
         return {"count": len(items), "offset": 0, "isContextMenu": 1, "item_loop": items}
+
+    async def _queue_item_uri(self, player_id: str, index: int) -> str | None:
+        """Return the media uri of the queue item at the given index."""
+        queue = self.mass.player_queues.get_active_queue(player_id)
+        if queue is None:
+            return None
+        page = self.mass.player_queues.items(queue.queue_id, 1, index)
+        if not page:
+            return None
+        return getattr(page[0].media_item, "uri", None)
 
     async def _handle_run_script(self, cmd: SlimCLICommand) -> None:
         """Run a Home Assistant script selected from the HA scripts menu."""
