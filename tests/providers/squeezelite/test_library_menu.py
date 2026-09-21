@@ -223,3 +223,75 @@ async def test_ha_script_items_explain_when_hass_is_missing() -> None:
     assert len(items) == 1
     assert "actions" not in items[0]
     assert "Home Assistant" in items[0]["text"]
+
+
+async def test_contextmenu_returns_play_actions() -> None:
+    """The context menu offers play now / add to queue / play next."""
+    menu = _make_menu()
+
+    result = await menu._handle_contextmenu(_cmd("ma_contextmenu", uri="library://track/1"))
+
+    assert result["isContextMenu"] == 1
+    texts = [item["text"] for item in result["item_loop"]]
+    assert texts == ["Play now", "Add to queue", "Play next"]
+    assert result["item_loop"][0]["actions"]["do"]["params"] == {
+        "uri": "library://track/1",
+        "cmd": "play",
+    }
+
+
+def test_playable_item_carries_context_menu_action() -> None:
+    """Playable rows expose a 'more' action that opens a context menu."""
+    menu = _make_menu()
+    item = menu._playable_item("A Track", "library://track/1")
+    more = item["actions"]["more"]
+    assert more["cmd"] == ["ma_contextmenu"]
+    assert more["window"] == {"isContextMenu": 1}
+
+
+def _queue_page_mass() -> Any:
+    """Build a fake mass exposing a three-item queue."""
+    queue_items = [
+        types.SimpleNamespace(
+            name=f"Track {index}",
+            media_item=types.SimpleNamespace(uri=f"library://track/{index}"),
+        )
+        for index in range(3)
+    ]
+    queue = types.SimpleNamespace(queue_id="q1", items=3, current_index=1)
+    return types.SimpleNamespace(
+        get_active_queue=lambda _player_id: queue,
+        items=lambda _queue_id, limit, offset: queue_items[offset : offset + limit],
+    )
+
+
+async def test_build_playlist_page_returns_real_queue() -> None:
+    """The playlist page reports the real queue size and jump actions."""
+    menu = _make_menu()
+    menu.mass.player_queues = _queue_page_mass()
+
+    page = await menu.build_playlist_page("aa:bb", 0, 200)
+
+    assert page is not None
+    assert page["count"] == 3
+    assert page["playlist_tracks"] == 3
+    assert page["playlist_cur_index"] == 1
+    assert page["offset"] == 0
+    assert len(page["item_loop"]) == 3
+    assert page["item_loop"][0]["actions"]["go"] == {
+        "player": 0,
+        "cmd": ["playlist", "index", 0],
+    }
+    assert page["item_loop"][0]["actions"]["more"]["window"] == {"isContextMenu": 1}
+
+
+async def test_build_playlist_page_starts_at_current_for_dash_offset() -> None:
+    """A '-' offset starts the page at the currently playing item."""
+    menu = _make_menu()
+    menu.mass.player_queues = _queue_page_mass()
+
+    page = await menu.build_playlist_page("aa:bb", "-", 200)
+
+    assert page is not None
+    assert page["offset"] == 1
+    assert page["item_loop"][0]["text"] == "Track 1"
