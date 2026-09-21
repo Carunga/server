@@ -418,22 +418,25 @@ class SqueezelitePlayer(Player):
         # all other: update attributes and update state
         self.update_attributes()
         self.update_state()
+        if event.type == SlimEventType.PLAYER_NAME_RECEIVED:
+            # the device reported its name; publish the (possibly custom) name back
+            self.mass.create_task(self._push_player_name())
 
     async def _push_player_name(self) -> None:
         """
-        Push the player's custom Music Assistant name to the device, when set.
+        Publish the Music Assistant player name to the device and to the server.
 
-        Only the user-configured name is pushed: at connect time the device has not
-        reported its own name yet, so falling back to display_name could push the
-        server's generic placeholder and rename the device.
+        The server-reported name (status/players) drives the SqueezePlay settings and
+        status UI, so it is always set. The LMS 'playername' pref is only pushed for a
+        user-configured name: at connect the device has not reported its own name yet,
+        so a display_name fallback could rename the device to the server placeholder.
         """
         if not self.client.connected:
             return
+        self.client.display_name = self.display_name
         if custom_name := self.config.name:
             self.logger.debug("Pushing custom player name %r to device", custom_name)
             await self.client.set_player_name(custom_name)
-        else:
-            self.logger.debug("No custom player name configured; not pushing a name")
 
     def update_attributes(self) -> None:
         """Update player attributes from slim player."""
