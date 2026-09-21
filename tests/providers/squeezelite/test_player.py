@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -155,3 +156,50 @@ async def test_live_streams_start_on_a_smaller_buffer(
 def test_is_protocol_only_device(device_model: str, expected: bool) -> None:
     """Test protocol-only device detection based on the reported device model."""
     assert is_protocol_only_device(device_model) is expected
+
+
+def _bare_player(
+    *, custom_name: str | None, device_name: str | None
+) -> tuple[SqueezelitePlayer, MagicMock]:
+    """Return an uninitialized player with mocked config, attributes and client."""
+    player = SqueezelitePlayer.__new__(SqueezelitePlayer)
+    player._cache = {}  # propcache storage used by display_name
+    player._config = SimpleNamespace(name=custom_name, default_name=None)
+    player._attr_name = device_name
+    player._player_id = "aa:bb:cc:dd:ee:ff"
+    player.logger = MagicMock()
+    player.client = client = MagicMock()
+    client.connected = True
+    client.set_player_name = AsyncMock()
+    return player, client
+
+
+async def test_push_player_name_publishes_display_name_and_pushes_custom_name() -> None:
+    """A custom name is sent to the device and published as the display name."""
+    player, client = _bare_player(custom_name="Küchen Radio", device_name=None)
+
+    await player._push_player_name()
+
+    assert client.display_name == "Küchen Radio"
+    client.set_player_name.assert_awaited_once_with("Küchen Radio")
+
+
+async def test_push_player_name_without_custom_name_only_publishes_device_name() -> None:
+    """Without a custom name only the server-reported name is set, nothing is pushed."""
+    player, client = _bare_player(custom_name=None, device_name="Keller-Lautsprecher")
+
+    await player._push_player_name()
+
+    assert client.display_name == "Keller-Lautsprecher"
+    client.set_player_name.assert_not_awaited()
+
+
+async def test_push_player_name_skips_disconnected_client() -> None:
+    """Nothing is published while the client is not connected."""
+    player, client = _bare_player(custom_name="Küchen Radio", device_name=None)
+    client.connected = False
+
+    await player._push_player_name()
+
+    assert client.display_name is None or client.display_name != "Küchen Radio"
+    client.set_player_name.assert_not_awaited()
