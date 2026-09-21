@@ -310,12 +310,12 @@ class SqueezeliteLibraryMenu:
         """
         hass = self._hass_provider()
         if hass is None:
-            return []
+            return [self._info_item("Home Assistant is not configured.")]
         try:
             registry = await hass.hass.get_entity_registry()
         except Exception:
             LOGGER.exception("Unable to fetch Home Assistant entity registry")
-            return []
+            return [self._info_item("Could not read Home Assistant scripts.")]
         label_ids = await self._label_ids(hass)
         entity_ids = [
             entity_id
@@ -324,7 +324,11 @@ class SqueezeliteLibraryMenu:
             and self._script_matches(entry, entity_id, label_ids)
         ]
         if not entity_ids:
-            return []
+            return [
+                self._info_item(
+                    f"No scripts found.\nAdd the label '{HA_LABEL}' to a script in Home Assistant."
+                )
+            ]
         names = await self._friendly_names(hass, entity_ids)
         rows = sorted(
             ((names.get(entity_id) or entity_id, entity_id) for entity_id in entity_ids),
@@ -433,6 +437,11 @@ class SqueezeliteLibraryMenu:
     # ------------------------------------------------------------------
     # item helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _info_item(text: str) -> dict[str, Any]:
+        """Build a non-actionable informational menu row."""
+        return {"text": text, "style": "itemNoAction"}
 
     def _playable_item(self, text: str, uri: str) -> dict[str, Any]:
         """Build a menu item that plays (and can enqueue) the given uri."""
