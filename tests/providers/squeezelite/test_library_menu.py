@@ -192,3 +192,34 @@ async def test_recommendation_items_render_playable() -> None:
     items = await menu._recommendation_items("tidal", "row1")
     assert [item["text"] for item in items] == ["A Track", "Nested Track"]
     assert items[0]["actions"]["play"]["params"]["uri"] == "tidal://track/1"
+
+
+async def test_ha_script_items_explain_when_no_labelled_scripts() -> None:
+    """With no matching scripts, the menu shows a non-actionable hint."""
+    hass = types.SimpleNamespace(
+        hass=types.SimpleNamespace(
+            get_entity_registry=AsyncMock(
+                return_value=[{"entity_id": "script.foo", "name": "Foo", "labels": []}]
+            ),
+            send_command=AsyncMock(return_value=[{"label_id": "l1", "name": "squeeze"}]),
+        ),
+        get_states=AsyncMock(return_value=[]),
+    )
+    menu = _make_menu(hass=hass)
+
+    items = await menu._ha_script_items()
+
+    assert len(items) == 1
+    assert "actions" not in items[0]
+    assert "squeeze" in items[0]["text"]
+
+
+async def test_ha_script_items_explain_when_hass_is_missing() -> None:
+    """Without the hass plugin the menu explains that Home Assistant is missing."""
+    menu = _make_menu()
+
+    items = await menu._ha_script_items()
+
+    assert len(items) == 1
+    assert "actions" not in items[0]
+    assert "Home Assistant" in items[0]["text"]
