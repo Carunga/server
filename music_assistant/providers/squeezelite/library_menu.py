@@ -479,6 +479,8 @@ class SqueezeliteLibraryMenu:
             option = QueueOption.ADD
         elif mode == "insert":
             option = QueueOption.NEXT
+        elif mode == "replace":
+            option = QueueOption.REPLACE
         else:
             option = QueueOption.PLAY
         self.provider.logger.debug(
@@ -515,6 +517,7 @@ class SqueezeliteLibraryMenu:
                 {"text": text, "actions": {"do": self._menu_action(uri, mode)}}
                 for text, mode in (
                     ("Play now", "play"),
+                    ("Play now and clear queue", "replace"),
                     ("Add to queue", "add"),
                     ("Play next", "insert"),
                 )
@@ -560,7 +563,7 @@ class SqueezeliteLibraryMenu:
             "player": 0,
             "cmd": ["playlistcontrol"],
             "params": {"uri": uri, "cmd": mode},
-            "nextWindow": "nowPlaying" if mode == "play" else "parent",
+            "nextWindow": "nowPlaying" if mode in ("play", "replace") else "parent",
         }
 
     @staticmethod

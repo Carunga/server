@@ -45,7 +45,12 @@ async def test_playlistcontrol_swallows_empty_playback_error() -> None:
 
 @pytest.mark.parametrize(
     ("mode", "expected"),
-    [("play", QueueOption.PLAY), ("add", QueueOption.ADD), ("insert", QueueOption.NEXT)],
+    [
+        ("play", QueueOption.PLAY),
+        ("replace", QueueOption.REPLACE),
+        ("add", QueueOption.ADD),
+        ("insert", QueueOption.NEXT),
+    ],
 )
 async def test_playlistcontrol_maps_modes(mode: str, expected: QueueOption) -> None:
     """The playlistcontrol mode maps to the matching queue option."""
@@ -233,7 +238,7 @@ async def test_contextmenu_returns_play_actions() -> None:
 
     assert result["isContextMenu"] == 1
     texts = [item["text"] for item in result["item_loop"]]
-    assert texts == ["Play now", "Add to queue", "Play next"]
+    assert texts == ["Play now", "Play now and clear queue", "Add to queue", "Play next"]
     assert result["item_loop"][0]["actions"]["do"]["params"] == {
         "uri": "library://track/1",
         "cmd": "play",
@@ -326,6 +331,7 @@ def test_media_context_menu_closes_or_switches() -> None:
     result = menu._media_context_menu("library://track/1")
 
     assert [item["actions"]["do"]["nextWindow"] for item in result["item_loop"]] == [
+        "nowPlaying",
         "nowPlaying",
         "parent",
         "parent",
