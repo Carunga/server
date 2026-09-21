@@ -107,6 +107,7 @@ class SqueezelitePlayerProvider(PlayerProvider):
             name="Music Assistant",
             control_port=control_port,
             cli_command_handler=self._handle_cli_command,
+            playlist_handler=self._handle_playlist_request,
         )
 
         # Reconciles the Sendspin bridges for this provider's players (gated by
@@ -128,8 +129,17 @@ class SqueezelitePlayerProvider(PlayerProvider):
         """
         if not cmd.player_id:
             raise NotImplementedError
-        if cmd.command in ("menu", "ma_browse", "playlistcontrol", "ma_run_script"):
+        if cmd.command in (
+            "menu",
+            "ma_browse",
+            "ma_contextmenu",
+            "playlistcontrol",
+            "ma_run_script",
+        ):
             return await self._library_menu.handle(cmd)
+        if cmd.command == "playlist":
+            await self._handle_playlist_command(cmd)
+            return None
         action = map_transport_command(cmd.command, list(cmd.args))
         if action is None:
             raise NotImplementedError
@@ -148,6 +158,19 @@ class SqueezelitePlayerProvider(PlayerProvider):
         elif action == "previous":
             await players.cmd_previous_track(cmd.player_id)
         return None
+
+    async def _handle_playlist_command(self, cmd: SlimCLICommand) -> None:
+        """Handle a `playlist index <n>` jump into the player's queue."""
+        if len(cmd.args) >= 2 and cmd.args[0] == "index" and isinstance(cmd.args[1], int):
+            await self._library_menu.play_index(cmd.player_id, cmd.args[1])
+            return
+        raise NotImplementedError
+
+    async def _handle_playlist_request(
+        self, player_id: str, offset: int | str, limit: int
+    ) -> dict[str, Any] | None:
+        """Return the player's queue page for the SqueezePlay playlist window."""
+        return await self._library_menu.build_playlist_page(player_id, offset, limit)
 
     async def loaded_in_mass(self) -> None:
         """Call after the provider has been loaded."""
