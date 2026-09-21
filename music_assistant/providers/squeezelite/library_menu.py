@@ -68,6 +68,8 @@ class SqueezeliteLibraryMenu:
             return await self._handle_menu(cmd)
         if cmd.command == "ma_browse":
             return await self._handle_browse(cmd)
+        if cmd.command == "ma_contextmenu":
+            return await self._handle_contextmenu(cmd)
         if cmd.command == "playlistcontrol":
             await self._handle_playlistcontrol(cmd)
             return None
@@ -275,6 +277,7 @@ class SqueezeliteLibraryMenu:
                         },
                         "play": self._play_action(album.uri, "play"),
                         "add": self._play_action(album.uri, "add"),
+                        "more": self._context_action(album.uri),
                     },
                 }
             )
@@ -292,6 +295,62 @@ class SqueezeliteLibraryMenu:
             return []
         tracks = await self.mass.music.albums.tracks(album_id, "library")
         return [self._playable_item(track.name, track.uri) for track in tracks]
+
+    # ------------------------------------------------------------------
+    # player queue
+    # ------------------------------------------------------------------
+
+    async def build_playlist_page(
+        self, player_id: str, offset: int | str, limit: int
+    ) -> dict[str, Any] | None:
+        """
+        Return the player's queue as an LMS playlist page for the status command.
+
+        The SqueezePlay playlist window pages through the status item_loop; this
+        supplies the real queue so it can show (and jump through) all items.
+        """
+        if not player_id:
+            return None
+        queue = self.mass.player_queues.get_active_queue(player_id)
+        if queue is None:
+            return None
+        total = int(queue.items or 0)
+        current = int(queue.current_index or 0)
+        start = current if offset == "-" else int(offset)
+        start = max(0, min(start, max(total - 1, 0)))
+        page = self.mass.player_queues.items(queue.queue_id, limit, start)
+        items: list[dict[str, Any]] = []
+        for page_index, queue_item in enumerate(page):
+            media = queue_item.media_item
+            uri = getattr(media, "uri", None)
+            item: dict[str, Any] = {"text": queue_item.name}
+            if uri:
+                index = start + page_index
+                item["style"] = "itemplay"
+                item["actions"] = {
+                    # tapping a queue row jumps to it instead of restarting the queue
+                    "go": {"player": 0, "cmd": ["playlist", "index", index]},
+                    "play": self._play_action(uri, "play"),
+                    "add": self._play_action(uri, "add"),
+                    "more": self._context_action(uri),
+                }
+            items.append(item)
+        return {
+            "count": total,
+            "offset": start,
+            "playlist_tracks": total,
+            "playlist_cur_index": current,
+            "item_loop": items,
+        }
+
+    async def play_index(self, player_id: str | None, index: int) -> None:
+        """Jump to the queue item at the given index for a player."""
+        if not player_id:
+            return
+        queue = self.mass.player_queues.get_active_queue(player_id)
+        if queue is None:
+            return
+        await self.mass.player_queues.play_index(queue.queue_id, index)
 
     # ------------------------------------------------------------------
     # Home Assistant scripts
@@ -421,6 +480,24 @@ class SqueezeliteLibraryMenu:
                 "Library menu: could not play %s on %s: %s", uri, cmd.player_id, err
             )
 
+    async def _handle_contextmenu(self, cmd: SlimCLICommand) -> dict[str, Any]:
+        """Return the context menu (play now / add to queue / play next) for a uri."""
+        uri = cmd.kwargs.get("uri")
+        items: list[dict[str, Any]] = []
+        if uri:
+            items = [
+                {
+                    "text": text,
+                    "actions": {"do": self._play_action(str(uri), mode)},
+                }
+                for text, mode in (
+                    ("Play now", "play"),
+                    ("Add to queue", "add"),
+                    ("Play next", "insert"),
+                )
+            ]
+        return {"count": len(items), "offset": 0, "isContextMenu": 1, "item_loop": items}
+
     async def _handle_run_script(self, cmd: SlimCLICommand) -> None:
         """Run a Home Assistant script selected from the HA scripts menu."""
         entity_id = cmd.kwargs.get("script")
@@ -452,7 +529,18 @@ class SqueezeliteLibraryMenu:
                 "go": self._play_action(uri, "play"),
                 "play": self._play_action(uri, "play"),
                 "add": self._play_action(uri, "add"),
+                "more": self._context_action(uri),
             },
+        }
+
+    @staticmethod
+    def _context_action(uri: str) -> dict[str, Any]:
+        """Build a context menu action for the given uri."""
+        return {
+            "player": 0,
+            "cmd": ["ma_contextmenu"],
+            "params": {"uri": uri},
+            "window": {"isContextMenu": 1},
         }
 
     @staticmethod
