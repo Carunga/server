@@ -254,6 +254,7 @@ def _queue_page_mass() -> Any:
     queue_items = [
         types.SimpleNamespace(
             name=f"Track {index}",
+            queue_item_id=f"qi{index}",
             media_item=types.SimpleNamespace(uri=f"library://track/{index}"),
         )
         for index in range(3)
@@ -297,7 +298,7 @@ async def test_build_playlist_page_dash_offset_returns_metadata_only() -> None:
 
 
 async def test_contextmenu_command_resolves_playlist_index() -> None:
-    """The built-in contextmenu command resolves the queue row at playlist_index."""
+    """The built-in contextmenu command returns the queue-row menu."""
     menu = _make_menu()
     menu.mass.player_queues = _queue_page_mass()
 
@@ -308,7 +309,60 @@ async def test_contextmenu_command_resolves_playlist_index() -> None:
     assert result["isContextMenu"] == 1
     assert [item["text"] for item in result["item_loop"]] == [
         "Play now",
-        "Add to queue",
         "Play next",
+        "Remove from queue",
+        "Clear playlist",
     ]
-    assert result["item_loop"][0]["actions"]["do"]["params"]["uri"] == "library://track/1"
+    assert result["item_loop"][0]["actions"]["do"]["cmd"] == ["playlist", "index", 1]
+    assert result["item_loop"][1]["actions"]["do"]["cmd"] == ["ma_queue_move_next"]
+    assert result["item_loop"][1]["actions"]["do"]["params"] == {"index": 1}
+    assert result["item_loop"][3]["actions"]["do"]["cmd"] == ["ma_queue_clear"]
+
+
+def test_media_context_menu_closes_or_switches() -> None:
+    """Play now opens Now Playing; add/next just close the context menu."""
+    menu = _make_menu()
+
+    result = menu._media_context_menu("library://track/1")
+
+    assert [item["actions"]["do"]["nextWindow"] for item in result["item_loop"]] == [
+        "nowPlaying",
+        "parent",
+        "parent",
+    ]
+
+
+async def test_queue_move_next_moves_item() -> None:
+    """Play next moves the existing queue item (pos_shift 0), it does not copy it."""
+    menu = _make_menu()
+    player_queues = _queue_page_mass()
+    player_queues.move_item = MagicMock()
+    menu.mass.player_queues = player_queues
+
+    await menu._handle_queue_move_next(_cmd("ma_queue_move_next", "aa:bb", index=1))
+
+    player_queues.move_item.assert_called_once_with("q1", "qi1", 0)
+
+
+async def test_queue_remove_deletes_item() -> None:
+    """Remove from queue deletes the queue item."""
+    menu = _make_menu()
+    player_queues = _queue_page_mass()
+    player_queues.delete_item = MagicMock()
+    menu.mass.player_queues = player_queues
+
+    await menu._handle_queue_remove(_cmd("ma_queue_remove", "aa:bb", index=1))
+
+    player_queues.delete_item.assert_called_once_with("q1", "qi1")
+
+
+async def test_queue_clear_clears_queue() -> None:
+    """Clear playlist clears the player queue."""
+    menu = _make_menu()
+    player_queues = _queue_page_mass()
+    player_queues.clear = MagicMock()
+    menu.mass.player_queues = player_queues
+
+    await menu._handle_queue_clear(_cmd("ma_queue_clear", "aa:bb"))
+
+    player_queues.clear.assert_called_once_with("q1")
