@@ -213,3 +213,29 @@ async def test_push_player_name_does_not_loop_when_device_already_reports_it() -
     await player._push_player_name()
 
     client.set_player_name.assert_not_awaited()
+
+
+def test_queue_event_bumps_playlist_timestamp() -> None:
+    """A queue change bumps the playlist timestamp so the client refreshes."""
+    player = SqueezelitePlayer.__new__(SqueezelitePlayer)
+    player._player_id = "aa:bb"
+    player.client = SimpleNamespace(extra_data={})
+    player.mass = mass = MagicMock()
+    mass.player_queues.get_active_queue.return_value = SimpleNamespace(queue_id="aa:bb")
+
+    player._handle_queue_event(SimpleNamespace(object_id="aa:bb"))
+
+    assert player.client.extra_data["playlist_timestamp"] > 0
+
+
+def test_queue_event_ignores_other_queues() -> None:
+    """A change to another queue does not touch this player's timestamp."""
+    player = SqueezelitePlayer.__new__(SqueezelitePlayer)
+    player._player_id = "aa:bb"
+    player.client = SimpleNamespace(extra_data={})
+    player.mass = mass = MagicMock()
+    mass.player_queues.get_active_queue.return_value = SimpleNamespace(queue_id="aa:bb")
+
+    player._handle_queue_event(SimpleNamespace(object_id="cc:dd"))
+
+    assert "playlist_timestamp" not in player.client.extra_data
