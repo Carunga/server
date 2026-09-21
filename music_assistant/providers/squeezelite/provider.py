@@ -122,6 +122,9 @@ class SqueezelitePlayerProvider(PlayerProvider):
             "ma_browse",
             "ma_contextmenu",
             "contextmenu",
+            "ma_queue_move_next",
+            "ma_queue_remove",
+            "ma_queue_clear",
             "playlistcontrol",
             "ma_run_script",
         ):

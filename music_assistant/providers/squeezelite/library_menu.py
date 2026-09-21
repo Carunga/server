@@ -72,6 +72,15 @@ class SqueezeliteLibraryMenu:
             return await self._handle_contextmenu(cmd)
         if cmd.command == "contextmenu":
             return await self._handle_contextmenu_command(cmd)
+        if cmd.command == "ma_queue_move_next":
+            await self._handle_queue_move_next(cmd)
+            return None
+        if cmd.command == "ma_queue_remove":
+            await self._handle_queue_remove(cmd)
+            return None
+        if cmd.command == "ma_queue_clear":
+            await self._handle_queue_clear(cmd)
+            return None
         if cmd.command == "playlistcontrol":
             await self._handle_playlistcontrol(cmd)
             return None
@@ -488,29 +497,22 @@ class SqueezeliteLibraryMenu:
             )
 
     async def _handle_contextmenu(self, cmd: SlimCLICommand) -> dict[str, Any]:
-        """Return the context menu (play now / add to queue / play next) for a uri."""
-        return self._context_menu(str(cmd.kwargs.get("uri") or ""))
+        """Return the media context menu (play now / add to queue / play next)."""
+        return self._media_context_menu(str(cmd.kwargs.get("uri") or ""))
 
     async def _handle_contextmenu_command(self, cmd: SlimCLICommand) -> dict[str, Any]:
-        """Handle the built-in `contextmenu` command (e.g. from the playlist window)."""
-        uri = str(cmd.kwargs.get("uri") or "")
-        if (
-            not uri
-            and cmd.player_id
-            and (raw_index := cmd.kwargs.get("playlist_index")) is not None
-        ):
-            uri = await self._queue_item_uri(cmd.player_id, int(raw_index)) or ""
-        return self._context_menu(uri)
+        """Handle the built-in `contextmenu` command (from the playlist window)."""
+        raw_index = cmd.kwargs.get("playlist_index")
+        if cmd.player_id and raw_index is not None:
+            return await self._queue_context_menu(cmd.player_id, int(raw_index))
+        return self._media_context_menu(str(cmd.kwargs.get("uri") or ""))
 
-    def _context_menu(self, uri: str) -> dict[str, Any]:
-        """Build the play/add/next context menu for a media uri."""
+    def _media_context_menu(self, uri: str) -> dict[str, Any]:
+        """Build the play now / add to queue / play next menu for a media uri."""
         items: list[dict[str, Any]] = []
         if uri:
             items = [
-                {
-                    "text": text,
-                    "actions": {"do": self._play_action(uri, mode)},
-                }
+                {"text": text, "actions": {"do": self._menu_action(uri, mode)}}
                 for text, mode in (
                     ("Play now", "play"),
                     ("Add to queue", "add"),
@@ -518,6 +520,60 @@ class SqueezeliteLibraryMenu:
                 )
             ]
         return {"count": len(items), "offset": 0, "isContextMenu": 1, "item_loop": items}
+
+    async def _queue_context_menu(self, player_id: str, index: int) -> dict[str, Any]:
+        """Build the queue-row context menu (play now / play next / remove / clear)."""
+        items: list[dict[str, Any]] = []
+        if await self._queue_item_uri(player_id, index) is not None:
+            items = [
+                {
+                    "text": "Play now",
+                    "actions": {
+                        "do": {
+                            "player": 0,
+                            "cmd": ["playlist", "index", index],
+                            "nextWindow": "nowPlaying",
+                        }
+                    },
+                },
+                {
+                    "text": "Play next",
+                    "actions": {"do": self._queue_action("ma_queue_move_next", index)},
+                },
+                {
+                    "text": "Remove from queue",
+                    "actions": {"do": self._queue_action("ma_queue_remove", index)},
+                },
+            ]
+        items.append(
+            {
+                "text": "Clear playlist",
+                "actions": {"do": self._queue_action("ma_queue_clear", None)},
+            }
+        )
+        return {"count": len(items), "offset": 0, "isContextMenu": 1, "item_loop": items}
+
+    @staticmethod
+    def _menu_action(uri: str, mode: str) -> dict[str, Any]:
+        """Build a media context-menu action (closes the menu, or opens Now Playing)."""
+        return {
+            "player": 0,
+            "cmd": ["playlistcontrol"],
+            "params": {"uri": uri, "cmd": mode},
+            "nextWindow": "nowPlaying" if mode == "play" else "parent",
+        }
+
+    @staticmethod
+    def _queue_action(command: str, index: int | None) -> dict[str, Any]:
+        """Build a queue context-menu action that closes the menu."""
+        action: dict[str, Any] = {
+            "player": 0,
+            "cmd": [command],
+            "nextWindow": "parent",
+        }
+        if index is not None:
+            action["params"] = {"index": index}
+        return action
 
     async def _queue_item_uri(self, player_id: str, index: int) -> str | None:
         """Return the media uri of the queue item at the given index."""
@@ -528,6 +584,38 @@ class SqueezeliteLibraryMenu:
         if not page:
             return None
         return getattr(page[0].media_item, "uri", None)
+
+    def _queue_item_id(self, player_id: str | None, index: Any) -> tuple[str | None, str | None]:
+        """Return (queue_id, queue_item_id) for a queue index, if valid."""
+        if not player_id or index is None:
+            return None, None
+        queue = self.mass.player_queues.get_active_queue(player_id)
+        if queue is None:
+            return None, None
+        page = self.mass.player_queues.items(queue.queue_id, 1, int(index))
+        if not page:
+            return None, None
+        return queue.queue_id, page[0].queue_item_id
+
+    async def _handle_queue_move_next(self, cmd: SlimCLICommand) -> None:
+        """Move the selected queue item to play next (without copying it)."""
+        queue_id, item_id = self._queue_item_id(cmd.player_id, cmd.kwargs.get("index"))
+        if queue_id and item_id:
+            self.mass.player_queues.move_item(queue_id, item_id, 0)
+
+    async def _handle_queue_remove(self, cmd: SlimCLICommand) -> None:
+        """Remove the selected item from the queue."""
+        queue_id, item_id = self._queue_item_id(cmd.player_id, cmd.kwargs.get("index"))
+        if queue_id and item_id:
+            self.mass.player_queues.delete_item(queue_id, item_id)
+
+    async def _handle_queue_clear(self, cmd: SlimCLICommand) -> None:
+        """Clear the player's queue."""
+        if not cmd.player_id:
+            return
+        queue = self.mass.player_queues.get_active_queue(cmd.player_id)
+        if queue is not None:
+            self.mass.player_queues.clear(queue.queue_id)
 
     async def _handle_run_script(self, cmd: SlimCLICommand) -> None:
         """Run a Home Assistant script selected from the HA scripts menu."""
