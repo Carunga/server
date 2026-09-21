@@ -285,13 +285,30 @@ async def test_build_playlist_page_returns_real_queue() -> None:
     assert page["item_loop"][0]["actions"]["more"]["window"] == {"isContextMenu": 1}
 
 
-async def test_build_playlist_page_starts_at_current_for_dash_offset() -> None:
-    """A '-' offset starts the page at the currently playing item."""
+async def test_build_playlist_page_dash_offset_returns_metadata_only() -> None:
+    """A '-' offset (now playing) returns only the queue metadata, not the item_loop."""
     menu = _make_menu()
     menu.mass.player_queues = _queue_page_mass()
 
-    page = await menu.build_playlist_page("aa:bb", "-", 200)
+    page = await menu.build_playlist_page("aa:bb", "-", 10)
 
-    assert page is not None
-    assert page["offset"] == 1
-    assert page["item_loop"][0]["text"] == "Track 1"
+    # item_loop/count/offset stay with aioslimproto's rich current/next item_loop
+    assert page == {"playlist_tracks": 3, "playlist_cur_index": 1}
+
+
+async def test_contextmenu_command_resolves_playlist_index() -> None:
+    """The built-in contextmenu command resolves the queue row at playlist_index."""
+    menu = _make_menu()
+    menu.mass.player_queues = _queue_page_mass()
+
+    result = await menu._handle_contextmenu_command(
+        _cmd("contextmenu", "aa:bb", playlist_index=1, context="playlist")
+    )
+
+    assert result["isContextMenu"] == 1
+    assert [item["text"] for item in result["item_loop"]] == [
+        "Play now",
+        "Add to queue",
+        "Play next",
+    ]
+    assert result["item_loop"][0]["actions"]["do"]["params"]["uri"] == "library://track/1"
