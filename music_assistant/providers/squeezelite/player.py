@@ -16,6 +16,7 @@ from aioslimproto.sync import SyncGroup
 from music_assistant_models.config_entries import ConfigEntry, ConfigValueOption
 from music_assistant_models.enums import (
     ConfigEntryType,
+    EventType,
     IdentifierType,
     MediaType,
     PlaybackState,
@@ -55,6 +56,7 @@ from .multi_client_stream import MultiClientStream
 
 if TYPE_CHECKING:
     from aioslimproto.client import SlimClient
+    from music_assistant_models.event import MassEvent
 
     from .provider import SqueezelitePlayerProvider
 
@@ -157,6 +159,26 @@ class SqueezelitePlayer(Player):
         await self.client.mute(init_muted)
         await self.client.volume_set(init_volume)
         await self.mass.players.register_or_update(self)
+        # a changing playlist_timestamp makes SqueezePlay refresh its open queue view
+        self.client.extra_data["playlist_timestamp"] = int(time.time())
+        self._unsub_queue_events = self.mass.subscribe(
+            self._handle_queue_event,
+            (EventType.QUEUE_UPDATED, EventType.QUEUE_ITEMS_UPDATED),
+        )
+
+    def _handle_queue_event(self, event: MassEvent) -> None:
+        """Bump the playlist timestamp when this player's queue changes."""
+        queue = self.mass.player_queues.get_active_queue(self.player_id)
+        if queue is None or event.object_id not in (None, queue.queue_id):
+            return
+        self.client.extra_data["playlist_timestamp"] = int(time.time())
+
+    async def on_unload(self) -> None:
+        """Handle player unload."""
+        if unsub := getattr(self, "_unsub_queue_events", None):
+            unsub()
+            self._unsub_queue_events = None
+        await super().on_unload()
 
     async def get_config_entries(self) -> list[ConfigEntry]:
         """Return all (provider/player specific) Config Entries for the player."""
