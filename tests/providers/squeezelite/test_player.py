@@ -170,6 +170,7 @@ def _bare_player(
     player.logger = MagicMock()
     player.client = client = MagicMock()
     client.connected = True
+    client.name = device_name
     client.set_player_name = AsyncMock()
     return player, client
 
@@ -202,4 +203,13 @@ async def test_push_player_name_skips_disconnected_client() -> None:
     await player._push_player_name()
 
     assert client.display_name is None or client.display_name != "Küchen Radio"
+    client.set_player_name.assert_not_awaited()
+
+
+async def test_push_player_name_does_not_loop_when_device_already_reports_it() -> None:
+    """A squeezelite player echoes the name back; an unchanged name must not be re-sent."""
+    player, client = _bare_player(custom_name="Küchen Radio", device_name="Küchen Radio")
+
+    await player._push_player_name()
+
     client.set_player_name.assert_not_awaited()

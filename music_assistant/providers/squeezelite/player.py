@@ -418,9 +418,6 @@ class SqueezelitePlayer(Player):
         # all other: update attributes and update state
         self.update_attributes()
         self.update_state()
-        if event.type == SlimEventType.PLAYER_NAME_RECEIVED:
-            # the device reported its name; publish the (possibly custom) name back
-            self.mass.create_task(self._push_player_name())
 
     async def _push_player_name(self) -> None:
         """
@@ -428,15 +425,18 @@ class SqueezelitePlayer(Player):
 
         The server-reported name (status/players) drives the SqueezePlay settings and
         status UI, so it is always set. The LMS 'playername' pref is only pushed for a
-        user-configured name: at connect the device has not reported its own name yet,
-        so a display_name fallback could rename the device to the server placeholder.
+        user-configured name that the device does not already report: a squeezelite
+        player echoes the setd frame back as its name, so re-sending an unchanged name
+        would loop forever.
         """
         if not self.client.connected:
             return
         self.client.display_name = self.display_name
-        if custom_name := self.config.name:
-            self.logger.debug("Pushing custom player name %r to device", custom_name)
-            await self.client.set_player_name(custom_name)
+        custom_name = self.config.name
+        if not custom_name or custom_name == self.client.name:
+            return
+        self.logger.debug("Pushing custom player name %r to device", custom_name)
+        await self.client.set_player_name(custom_name)
 
     def update_attributes(self) -> None:
         """Update player attributes from slim player."""
