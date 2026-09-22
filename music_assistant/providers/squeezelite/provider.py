@@ -192,6 +192,7 @@ class SqueezelitePlayerProvider(PlayerProvider):
             "/slimproto/multi", self._serve_multi_client_stream
         )
         self.mass.streams.register_dynamic_route("/slimproto/ha_icon.png", self._serve_ha_icon)
+        self.mass.streams.register_dynamic_route("/slimproto/sendspin", self._serve_sendspin_stream)
         # it seems that WiiM devices do not use the json rpc port that is broadcasted
         # in the discovery info but instead they just assume that the jsonrpc endpoint
         # lives on the same server as stream URL. So we need to provide a jsonrpc.js
@@ -209,6 +210,7 @@ class SqueezelitePlayerProvider(PlayerProvider):
         await self._cleanup_server()
         self.mass.streams.unregister_dynamic_route("/slimproto/multi")
         self.mass.streams.unregister_dynamic_route("/slimproto/ha_icon.png")
+        self.mass.streams.unregister_dynamic_route("/slimproto/sendspin")
         self.mass.streams.unregister_dynamic_route("/jsonrpc.js")
 
     def get_corrected_elapsed_milliseconds(self, slimplayer: SlimClient) -> int:
@@ -360,3 +362,13 @@ class SqueezelitePlayerProvider(PlayerProvider):
                 # race condition
                 break
         return resp
+
+    async def _serve_sendspin_stream(self, request: web.Request) -> web.StreamResponse:
+        """Serve the Sendspin bridge PCM audio for a Squeezelite player."""
+        player_id = request.query.get("player_id")
+        if not player_id:
+            raise web.HTTPNotFound(reason="Missing player_id parameter")
+        bridge = self._bridge_manager.get_bridge(player_id)
+        if bridge is None:
+            raise web.HTTPNotFound(reason=f"No Sendspin bridge for player: {player_id}")
+        return await bridge.serve_pcm_stream(request)
