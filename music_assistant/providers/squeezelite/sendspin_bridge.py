@@ -59,11 +59,12 @@ if TYPE_CHECKING:
 
 # Lead (ms) reported to Sendspin so it schedules the first chunk far enough ahead
 # of the instant it wants audible. It has to cover fetching the bridge stream
-# over HTTP plus filling the device's output buffer. SlimProto's default output
-# threshold is ~200 KB, about 1.1 s at 44.1 kHz/16-bit stereo, so the cold value
-# leaves a margin over that; a kept, already-connected device pays less.
-SLIM_BRIDGE_COLD_START_LEAD_MS: int = 2500
-SLIM_BRIDGE_WARM_START_LEAD_MS: int = 1200
+# over HTTP plus filling the device's output buffer. Tuned so the Radio becomes
+# audible on the Sendspin instant: the device starts ~1.3 s after it begins
+# buffering, so a 2500 ms lead started it ~1.2 s early and the drift loop had to
+# pull it back. Keep it above the device's buffer fill time or it underruns.
+SLIM_BRIDGE_COLD_START_LEAD_MS: int = 1400
+SLIM_BRIDGE_WARM_START_LEAD_MS: int = 1300
 
 # Ongoing buffer (ms) Sendspin keeps the bridge supplied with for the whole
 # stream, so the device's ring stays fed without charging every other group
@@ -94,14 +95,16 @@ _CHUNK_HISTORY = 64
 
 # Drift correction (Phase 3). The device position (from its own elapsed report)
 # is compared to the Sendspin timeline; outside the deadband the difference is
-# corrected with a skip/pause. The device may start up to ~1 s early because the
-# Radio starts on buffer-ready rather than honouring the scheduled unpause, so
-# the loop also pulls the initial offset in.
+# corrected with a damped skip/pause. Corrections are deliberately gentle (half
+# the offset, capped) and only run after a settle and a stable sign, because a
+# full-magnitude step at stream start overshoots and oscillates audibly.
 _SYNC_DEADBAND_MS: int = 120
-_SYNC_MAX_CORRECTION_MS: int = 2000
-_SYNC_MIN_INTERVAL_S: float = 1.5
-_SYNC_START_GRACE_S: float = 3.0
+_SYNC_MAX_CORRECTION_MS: int = 300
+_SYNC_CORRECTION_GAIN: float = 0.5
+_SYNC_MIN_INTERVAL_S: float = 2.5
+_SYNC_START_GRACE_S: float = 6.0
 _SYNC_MONITOR_INTERVAL_S: float = 0.5
+_SYNC_STABLE_SAMPLES: int = 2
 
 
 def sendspin_audible_unix(audible_instant_us: int, sendspin_now_us: int, unix_now: float) -> float:
@@ -186,6 +189,10 @@ class SendspinSqueezeliteBridge:
         self._monitor_task: asyncio.Task[None] | None = None
         self._stream_started_at: float = 0.0
         self._last_correction_at: float = 0.0
+        # Consecutive samples outside the deadband with the same sign, so a
+        # startup transient is not mistaken for real drift.
+        self._offset_sign: int = 0
+        self._offset_sign_run: int = 0
 
     @property
     def is_registered(self) -> bool:
@@ -396,6 +403,8 @@ class SendspinSqueezeliteBridge:
         self._first_chunk_audible_unix = None
         self._stream_started_at = time.time()
         self._last_correction_at = 0.0
+        self._offset_sign = 0
+        self._offset_sign_run = 0
         self._start_monitor()
         self.logger.debug(
             "Sendspin stream started for %s; awaiting first chunk",
@@ -571,34 +580,57 @@ class SendspinSqueezeliteBridge:
             f"{start_delta_ms:.0f}ms" if start_delta_ms is not None else "n/a",
             client.state,
         )
+        self._track_offset_sign(offset_ms)
         if not self._should_correct(now, client):
             return
-        if abs(offset_ms) <= _SYNC_DEADBAND_MS:
+        if self._offset_sign == 0:
             return
-        correction_ms = max(-_SYNC_MAX_CORRECTION_MS, min(_SYNC_MAX_CORRECTION_MS, int(offset_ms)))
+        # Correct only a fraction of the offset, capped, so an estimate that is
+        # off (or a startup transient) is a gentle nudge rather than a 1.5 s pause.
+        step_ms = max(1, int(abs(offset_ms) * _SYNC_CORRECTION_GAIN))
+        step_ms = min(step_ms, _SYNC_MAX_CORRECTION_MS)
         self._last_correction_at = now
-        if correction_ms > 0:
+        self._offset_sign_run = 0
+        if self._offset_sign > 0:
             # device is ahead of the timeline - hold it back
             self.logger.debug(
                 "Bridge sync: pausing %s for %d ms",
                 self.squeezelite_player.display_name,
-                correction_ms,
+                step_ms,
             )
-            self.mass.create_task(client.pause_for(correction_ms))
+            self.mass.create_task(client.pause_for(step_ms))
         else:
             # device is behind the timeline - jump it forward
             self.logger.debug(
                 "Bridge sync: skipping %s ahead %d ms",
                 self.squeezelite_player.display_name,
-                -correction_ms,
+                step_ms,
             )
-            self.mass.create_task(client.skip_over(-correction_ms))
+            self.mass.create_task(client.skip_over(step_ms))
+
+    def _track_offset_sign(self, offset_ms: float) -> None:
+        """Track how many consecutive samples share the same out-of-deadband sign."""
+        if offset_ms > _SYNC_DEADBAND_MS:
+            sign = 1
+        elif offset_ms < -_SYNC_DEADBAND_MS:
+            sign = -1
+        else:
+            sign = 0
+        if sign == 0:
+            self._offset_sign_run = 0
+        elif sign == self._offset_sign:
+            self._offset_sign_run += 1
+        else:
+            self._offset_sign_run = 1
+        self._offset_sign = sign
 
     def _should_correct(self, now: float, client: SlimClient) -> bool:
         """Return whether a drift correction may run right now."""
         if client.state != SlimPlayerState.PLAYING:
             return False
         if now - self._stream_started_at < _SYNC_START_GRACE_S:
+            return False
+        if self._offset_sign_run < _SYNC_STABLE_SAMPLES:
             return False
         return now - self._last_correction_at >= _SYNC_MIN_INTERVAL_S
 
