@@ -1,6 +1,22 @@
 # SlimProto ↔ Sendspin bridge — design & status
 
-Work-in-progress branch `feat/squeezelite-sendspin-bridge` (fork only, no PR).
+Canonical branch `feat/squeezelite-sendspin-bridge` (off upstream `dev`, fork
+only, no PR yet).
+
+## Branching
+
+All Sendspin bridge changes live **only** on this branch, so a future PR is
+independent of the other Squeezelite work:
+
+- Base: upstream `dev`; the provider manifest keeps `aioslimproto==3.2.2` so the
+  PR does not depend on the patched fork. Locally the dev container gets the
+  sync primitives through its `PYTHONPATH=/opt/patched` overlay.
+- Testing/integration: `feat/squeezelite-all` merges this branch together with
+  `feat/squeezelite-menus`; it is a test target only, never a source.
+- `feat/squeezelite-menus` must stay free of `sendspin_bridge.py`.
+- The upstream Sendspin provider (`providers/sendspin/**`,
+  `providers/sendspin_source/**`, `aiosendspin`) is **not modified** — the
+  bridge only calls its public API.
 
 ## Goal
 
