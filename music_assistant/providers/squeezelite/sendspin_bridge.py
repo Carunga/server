@@ -64,8 +64,8 @@ if TYPE_CHECKING:
 # audible on the Sendspin instant: the device starts ~1.3 s after it begins
 # buffering, so a 2500 ms lead started it ~1.2 s early and the drift loop had to
 # pull it back. Keep it above the device's buffer fill time or it underruns.
-SLIM_BRIDGE_COLD_START_LEAD_MS: int = 1800
-SLIM_BRIDGE_WARM_START_LEAD_MS: int = 1700
+SLIM_BRIDGE_COLD_START_LEAD_MS: int = 1750
+SLIM_BRIDGE_WARM_START_LEAD_MS: int = 1650
 
 # Ongoing buffer (ms) Sendspin keeps the bridge supplied with for the whole
 # stream, so the device's ring stays fed without charging every other group
@@ -91,6 +91,10 @@ _BRIDGE_OUTPUT_THRESHOLD_TENTHS: int = 20
 # to an ever growing queue.
 _PCM_QUEUE_MAX_CHUNKS: int = 512
 
+# A read from the PCM queue that blocked longer than this (after the first chunk)
+# means the device fetch ran dry - logged separately from controller corrections.
+_PCM_STARVE_LOG_S: float = 0.5
+
 # Cap on the diagnostic chunk history kept per bridge.
 _CHUNK_HISTORY = 64
 
@@ -102,8 +106,9 @@ _CHUNK_HISTORY = 64
 _SYNC_DEADBAND_MS: int = 120
 _SYNC_MAX_CORRECTION_MS: int = 300
 _SYNC_CORRECTION_GAIN: float = 0.5
-_SYNC_MIN_INTERVAL_S: float = 2.5
-_SYNC_START_GRACE_S: float = 3.0
+_SYNC_FIRST_CORRECTION_GAIN: float = 1.0
+_SYNC_MIN_INTERVAL_S: float = 1.5
+_SYNC_START_GRACE_S: float = 1.5
 _SYNC_MONITOR_INTERVAL_S: float = 0.5
 _SYNC_STABLE_SAMPLES: int = 2
 
@@ -197,6 +202,7 @@ class SendspinSqueezeliteBridge:
         # Signature of the now-playing media last pushed to the device, so the
         # monitor loop only updates the display on an actual track change.
         self._last_now_playing: tuple[object, ...] | None = None
+        self._corrections_applied: int = 0
 
     @property
     def is_registered(self) -> bool:
@@ -348,15 +354,36 @@ class SendspinSqueezeliteBridge:
         queue = self._pcm_queue
         generation = self._stream_generation
         self.logger.debug("Serving bridge PCM to %s", self.squeezelite_player.display_name)
+        served_chunks = 0
+        starved = 0
         while generation == self._stream_generation:
+            waited_from = time.monotonic()
             chunk = await queue.get()
+            wait_s = time.monotonic() - waited_from
             if chunk is None:
                 break
+            if served_chunks and wait_s > _PCM_STARVE_LOG_S:
+                # the source had nothing ready for a while -> the device buffer
+                # may underrun (glitch). Log so it can be told apart from a
+                # controller correction.
+                starved += 1
+                self.logger.debug(
+                    "Bridge PCM source starved %.0f ms for %s",
+                    wait_s * 1000,
+                    self.squeezelite_player.display_name,
+                )
+            served_chunks += 1
             try:
                 await resp.write(chunk)
             except ConnectionError, RuntimeError:
                 # aioslimproto closed its fetch (stream restart/stop) - not an error
                 break
+        if starved:
+            self.logger.info(
+                "Bridge PCM source starved %d time(s) for %s",
+                starved,
+                self.squeezelite_player.display_name,
+            )
         with suppress(Exception):
             await resp.write_eof()
         return resp
@@ -410,6 +437,7 @@ class SendspinSqueezeliteBridge:
         self._offset_sign = 0
         self._offset_sign_run = 0
         self._last_now_playing = None
+        self._corrections_applied = 0
         self._start_monitor()
         self.logger.debug(
             "Sendspin stream started for %s; awaiting first chunk",
@@ -453,6 +481,7 @@ class SendspinSqueezeliteBridge:
         self._chunks.clear()
         self._stop_monitor()
         self._signal_pcm_end()
+        self._log_stream_summary()
         self.logger.debug("Sendspin stream ended for %s", self.squeezelite_player.display_name)
 
     def _on_bridge_explicit_stop(self) -> None:
@@ -463,8 +492,18 @@ class SendspinSqueezeliteBridge:
         self._chunks.clear()
         self._stop_monitor()
         self._signal_pcm_end()
+        self._log_stream_summary()
         self.mass.create_task(self.squeezelite_player.client.stop())
         self.logger.debug("Sendspin explicit stop for %s", self.squeezelite_player.display_name)
+
+    def _log_stream_summary(self) -> None:
+        """Log how many drift corrections the stream that just ended used."""
+        if self._corrections_applied:
+            self.logger.info(
+                "Bridge sync for %s used %d correction(s)",
+                self.squeezelite_player.display_name,
+                self._corrections_applied,
+            )
 
     def _start_player_stream(self) -> None:
         """Start the SlimProto transport on the bridge PCM source."""
@@ -617,12 +656,17 @@ class SendspinSqueezeliteBridge:
             return
         if self._offset_sign == 0:
             return
-        # Correct only a fraction of the offset, capped, so an estimate that is
-        # off (or a startup transient) is a gentle nudge rather than a 1.5 s pause.
-        step_ms = max(1, int(abs(offset_ms) * _SYNC_CORRECTION_GAIN))
+        # The first fix takes the whole offset (still capped) so the start
+        # converges in one step; later fixes are damped so an estimate that is
+        # off is a gentle nudge rather than an audible 1.5 s pause.
+        gain = (
+            _SYNC_FIRST_CORRECTION_GAIN if self._corrections_applied == 0 else _SYNC_CORRECTION_GAIN
+        )
+        step_ms = max(1, int(abs(offset_ms) * gain))
         step_ms = min(step_ms, _SYNC_MAX_CORRECTION_MS)
         self._last_correction_at = now
         self._offset_sign_run = 0
+        self._corrections_applied += 1
         if self._offset_sign > 0:
             # device is ahead of the timeline - hold it back
             self.logger.debug(
