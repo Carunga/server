@@ -125,9 +125,6 @@ class SqueezelitePlayer(Player):
         ]
         self.multi_client_stream: MultiClientStream | None = None
         self._sync_group = SyncGroup()
-        # Set while a Sendspin bridge is streaming to this player: the bridge
-        # anchors the start itself, so buffer-ready must not auto-unpause.
-        self._sendspin_bridge_owns_start = False
 
     async def on_config_updated(self) -> None:
         """Handle logic when the PlayerConfig is first loaded or updated."""
@@ -182,14 +179,6 @@ class SqueezelitePlayer(Player):
             unsub()
             self._unsub_queue_events = None
         await super().on_unload()
-
-    def begin_sendspin_bridge_playback(self) -> None:
-        """Mark the player as driven by a Sendspin bridge, which anchors the start."""
-        self._sendspin_bridge_owns_start = True
-
-    def end_sendspin_bridge_playback(self) -> None:
-        """Clear the Sendspin-bridge-owned start marker."""
-        self._sendspin_bridge_owns_start = False
 
     async def get_config_entries(self) -> list[ConfigEntry]:
         """Return all (provider/player specific) Config Entries for the player."""
@@ -601,10 +590,6 @@ class SqueezelitePlayer(Player):
 
         Only used when autoplay=0 for coordinated start of synced players.
         """
-        if self._sendspin_bridge_owns_start:
-            # The Sendspin bridge schedules the start itself (unpause_at on the
-            # Sendspin audible instant); unpausing here would defeat that anchor.
-            return
         if self.synced_to:
             # unpause of sync child is handled by sync master
             return

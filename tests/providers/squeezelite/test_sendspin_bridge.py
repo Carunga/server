@@ -20,7 +20,7 @@ _INVALID_ID = "not-a-mac"
 
 def _make_bridge(player_id: str) -> SendspinSqueezeliteBridge:
     provider = SimpleNamespace(mass=object(), logger=logging.getLogger("test"))
-    player = SimpleNamespace(player_id=player_id)
+    player = SimpleNamespace(player_id=player_id, display_name=player_id)
     return SendspinSqueezeliteBridge(provider, player, sendspin_server=object())
 
 
@@ -35,6 +35,49 @@ def test_sendspin_audible_unix_transfers_only_the_future_offset() -> None:
     assert sendspin_audible_unix(1_500_000, 0, 1000.0) == 1001.5
     # already-past instant maps to a unix time before now
     assert sendspin_audible_unix(500_000, 1_000_000, 1000.0) == 999.5
+
+
+def test_build_play_metadata_uses_the_sendspin_media() -> None:
+    """The now-playing metadata comes from the Sendspin player's current media."""
+    bridge = _make_bridge(_VALID_MAC)
+    bridge._bridge_client_id = "spb_x"
+    media = SimpleNamespace(
+        uri="library://track/1",
+        title="Title",
+        artist="Artist",
+        album="Album",
+        image_url="http://host/art.png",
+        duration=123,
+        stream_duration=None,
+    )
+    bridge.mass = SimpleNamespace(
+        players=SimpleNamespace(get_player=lambda _pid: SimpleNamespace(current_media=media))
+    )
+
+    metadata = bridge._build_play_metadata()
+
+    assert metadata == {
+        "item_id": "library://track/1",
+        "title": "Title",
+        "artist": "Artist",
+        "album": "Album",
+        "image_url": "http://host/art.png",
+        "duration": 123,
+    }
+
+
+def test_build_play_metadata_falls_back_to_a_placeholder() -> None:
+    """Without Sendspin media the bridge still names the stream."""
+    bridge = _make_bridge(_VALID_MAC)
+    bridge._bridge_client_id = "spb_x"
+    bridge.mass = SimpleNamespace(
+        players=SimpleNamespace(get_player=lambda _pid: SimpleNamespace(current_media=None))
+    )
+
+    metadata = bridge._build_play_metadata()
+
+    assert metadata["item_id"] == "sendspin-bridge"
+    assert metadata["title"] == _VALID_MAC
 
 
 def test_bridge_client_id_uses_the_mac_only_when_valid() -> None:

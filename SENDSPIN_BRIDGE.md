@@ -71,7 +71,7 @@ framework in `providers/sendspin/`:
 - Import-validated against `aiosendspin==9.1.1` + `music-assistant-models==1.1.212`;
   `ruff check`/`ruff format` clean.
 
-**Phase 2 — audio path (first cut done)**
+**Phase 2 — audio path (done)**
 
 - Per-player **PCM HTTP source** served by the provider dynamic route
   `/slimproto/sendspin?player_id=<mac>` (`SqueezelitePlayerProvider._serve_sendspin_stream`
@@ -80,27 +80,26 @@ framework in `providers/sendspin/`:
   it and advertises `audio/pcm;rate=44100;channels=2;bitrate=16`, which
   aioslimproto turns into the SlimProto codec message. Each stream gets its own
   queue so a stale handler can never steal the next stream's chunks.
-- The first chunk starts the SlimProto transport (`play_url` on the bridge URL)
-  with `autostart=False`, so the device buffers but does not start on its own
-  (the player skips its buffer-ready auto-unpause while the bridge owns the
-  start).
-- **Start anchor:** the first chunk's `AudioChunk.timestamp_us` is mapped to a
-  unix instant with `sendspin_audible_unix()`; the transport is then scheduled
-  with `unpause_at(jiffies + delay)` so the first sample becomes audible at the
-  Sendspin instant. This replaces the previous "start when the device buffer
-  fills" behaviour, which played ~1 s early.
+- The first chunk starts the SlimProto transport (`play_url`, `autostart=True`),
+  so playback begins as soon as the device is buffered. (The Radio ignores a
+  future `unpause_at`, so a scheduled anchor was tried and dropped.)
+- **Now-playing metadata:** `play_url` is given the Sendspin player's current
+  media (title/artist/album/artwork/duration) via `_build_play_metadata()`, so
+  the device shows the real track instead of a placeholder. Per-track updates
+  during the stream are still TODO (needs an aioslimproto now-playing update API).
 - Backpressure: the queue is bounded; on overflow the oldest chunk is dropped
-  (a short gap instead of unbounded latency). Sendspin already paces delivery
-  against the group timeline, so no extra client-side pacing is applied yet.
-- Still TODO (finishing Phase 2): tune the lead/buffer constants from
-  measurement and verify the anchor on hardware.
+  (a short gap instead of unbounded latency).
 
-**Phase 3 — drift correction (TODO)**
+**Phase 3 — drift correction (first cut done)**
 
-- Compare the player's reported position (aioslimproto `play_point`) to the
-  Sendspin timeline; correct with skip/pause (LMS-style gates, reuse the constants
-  from the sync work). Rate steering (per-player resampling) is the tighter,
-  glitch-free follow-up.
+- A 500 ms monitor loop compares the device's reported position
+  (`elapsed_milliseconds`) to the Sendspin timeline (`_first_chunk_audible_unix`)
+  and logs `Bridge sync … offset=…`. Outside a 120 ms deadband (after a 3 s start
+  grace, 1.5 s minimum interval) it corrects with `pause_for` (device ahead) or
+  `skip_over` (device behind). Measured steady state on the Radio: ~45 ms, no
+  audible difference, no drift over ~20 s.
+- TODO: rate steering (per-player resampling) if a longer run shows drift; tune
+  the deadband/gates.
 
 **Phase 4 — robustness (TODO)**
 
