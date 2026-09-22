@@ -44,7 +44,7 @@ from music_assistant.providers.sendspin.bridge_role import (
 )
 from music_assistant.providers.sendspin.helpers import bridge_client_id_from_mac
 
-from .constants import CONF_SENDSPIN_BRIDGE, DEFAULT_PLAYER_VOLUME
+from .constants import CONF_SENDSPIN_BRIDGE, CONF_SENDSPIN_BRIDGE_LEAD, DEFAULT_PLAYER_VOLUME
 
 if TYPE_CHECKING:
     from aiosendspin.server import ExternalStreamStartRequest, SendspinClient, SendspinServer
@@ -58,14 +58,24 @@ if TYPE_CHECKING:
     from .provider import SqueezelitePlayerProvider
 
 
-# Lead (ms) reported to Sendspin so it schedules the first chunk far enough ahead
-# of the instant it wants audible. It has to cover fetching the bridge stream
-# over HTTP plus filling the device's output buffer. Tuned so the Radio becomes
-# audible on the Sendspin instant: the device starts ~1.3 s after it begins
-# buffering, so a 2500 ms lead started it ~1.2 s early and the drift loop had to
-# pull it back. Keep it above the device's buffer fill time or it underruns.
-SLIM_BRIDGE_COLD_START_LEAD_MS: int = 1750
+# Default lead (ms) reported to Sendspin so it schedules the first chunk far
+# enough ahead of the instant it wants audible. It has to cover fetching the
+# bridge stream over HTTP plus filling the device's output buffer; the bridge
+# learns the per-player value from the measured start error (see below).
+SLIM_BRIDGE_COLD_START_LEAD_MS: int = 1800
 SLIM_BRIDGE_WARM_START_LEAD_MS: int = 1650
+
+# Lead learning: the per-player cold lead is adjusted from the measured start
+# error (start_delta = device apparent start - intended audible start). The
+# relation is ~1:1, so a full step would null it; the gain damps run-to-run
+# WiFi variance instead. The value is persisted as a raw player config value.
+_LEAD_LEARN_GAIN: float = 0.7
+_LEAD_MIN_MS: int = 1200
+_LEAD_MAX_MS: int = 2600
+_LEAD_PERSIST_MIN_MS: int = 15
+# A stream starting within this window reuses a warm transport (less lead).
+_LEAD_WARM_WINDOW_S: float = 8.0
+_LEAD_WARM_REDUCTION_MS: int = 150
 
 # Ongoing buffer (ms) Sendspin keeps the bridge supplied with for the whole
 # stream, so the device's ring stays fed without charging every other group
@@ -132,6 +142,39 @@ def sendspin_audible_unix(audible_instant_us: int, sendspin_now_us: int, unix_no
     return unix_now + (audible_instant_us - sendspin_now_us) / 1_000_000
 
 
+def resolve_lead_ms(cold_lead_ms: int, *, warm: bool) -> int:
+    """
+    Return the lead to report for a cold or warm transport.
+
+    A warm transport (a stream starting right after a previous one) still has the
+    device connected and buffered, so it needs less lead than a cold one.
+
+    :param cold_lead_ms: The learned cold-start lead for the player.
+    :param warm: Whether the transport is already warm.
+    """
+    if not warm:
+        return cold_lead_ms
+    return max(_LEAD_MIN_MS, cold_lead_ms - _LEAD_WARM_REDUCTION_MS)
+
+
+def learn_lead_ms(current_lead_ms: int, start_delta_ms: float, *, gain: float) -> int:
+    """
+    Adjust a player's cold lead from the start error measured for a stream.
+
+    ``start_delta_ms`` is ``device apparent start - intended audible start``: a
+    positive value means the device started late (needs more lead), a negative
+    value means it started early (needs less).
+
+    :param current_lead_ms: The lead currently stored for the player.
+    :param start_delta_ms: The measured start error in milliseconds.
+    :param gain: How much of the error to fold in (0..1) to damp run-to-run variance.
+    :return: The clamped, updated lead in milliseconds.
+    """
+    target = current_lead_ms - start_delta_ms
+    updated = round(current_lead_ms + gain * (target - current_lead_ms))
+    return max(_LEAD_MIN_MS, min(_LEAD_MAX_MS, updated))
+
+
 def get_bridge_client_id(squeezelite_player: SqueezelitePlayer) -> str | None:
     """
     Get the Sendspin bridge client ID for a Squeezelite player.
@@ -179,6 +222,19 @@ class SendspinSqueezeliteBridge:
         self._bridge_client_id: str | None = None
         self._bridge_role: BridgePlayerRole | None = None
         self._is_streaming = False
+        # Learned cold-start lead (ms), persisted as a raw player config value.
+        self._cold_lead_ms = int(
+            self.mass.config.get_raw_player_config_value(
+                self.squeezelite_player.player_id,
+                CONF_SENDSPIN_BRIDGE_LEAD,
+                SLIM_BRIDGE_COLD_START_LEAD_MS,
+            )
+        )
+        self._persisted_lead_ms = self._cold_lead_ms
+        # Latest start error for the current stream (device apparent start minus
+        # intended audible start); folded into the lead when the stream ends.
+        self._last_start_delta_ms: float | None = None
+        self._last_stream_end_at: float = 0.0
         # Diagnostic history of the chunks received for the current stream.
         self._chunks: deque[AudioChunk] = deque(maxlen=_CHUNK_HISTORY)
         # PCM handed from the Sendspin callback to the HTTP source the SlimProto
@@ -406,8 +462,19 @@ class SendspinSqueezeliteBridge:
         """Push the SlimProto startup lead and ongoing buffer to the bridge role."""
         if self._bridge_role is None:
             return
+        warm = bool(
+            self._last_stream_end_at
+            and (time.time() - self._last_stream_end_at) < _LEAD_WARM_WINDOW_S
+        )
+        lead_ms = resolve_lead_ms(self._cold_lead_ms, warm=warm)
+        self.logger.debug(
+            "Sendspin bridge lead for %s: %d ms (%s)",
+            self.squeezelite_player.display_name,
+            lead_ms,
+            "warm" if warm else "cold",
+        )
         self._bridge_role.set_timing(
-            required_lead_time_ms=SLIM_BRIDGE_COLD_START_LEAD_MS,
+            required_lead_time_ms=lead_ms,
             min_buffer_ms=SLIM_BRIDGE_MIN_BUFFER_MS,
         )
 
@@ -420,6 +487,7 @@ class SendspinSqueezeliteBridge:
         )
         self._chunks.clear()
         self._is_streaming = True
+        self._last_start_delta_ms = None
         self._refresh_bridge_timing()
 
     def _on_bridge_stream_start(self) -> None:
@@ -482,6 +550,8 @@ class SendspinSqueezeliteBridge:
         self._stop_monitor()
         self._signal_pcm_end()
         self._log_stream_summary()
+        self._learn_lead()
+        self._last_stream_end_at = time.time()
         self.logger.debug("Sendspin stream ended for %s", self.squeezelite_player.display_name)
 
     def _on_bridge_explicit_stop(self) -> None:
@@ -493,8 +563,34 @@ class SendspinSqueezeliteBridge:
         self._stop_monitor()
         self._signal_pcm_end()
         self._log_stream_summary()
+        self._learn_lead()
+        self._last_stream_end_at = time.time()
         self.mass.create_task(self.squeezelite_player.client.stop())
         self.logger.debug("Sendspin explicit stop for %s", self.squeezelite_player.display_name)
+
+    def _learn_lead(self) -> None:
+        """Fold the measured start error into the player's stored cold lead."""
+        start_delta_ms = self._last_start_delta_ms
+        if start_delta_ms is None:
+            return
+        # Consume the measurement: stream-end and explicit-stop can both fire for
+        # the same stream, and it must only be folded in once.
+        self._last_start_delta_ms = None
+        updated = learn_lead_ms(self._cold_lead_ms, start_delta_ms, gain=_LEAD_LEARN_GAIN)
+        self.logger.debug(
+            "Bridge lead for %s learned: %d -> %d ms (start_delta=%.0f ms)",
+            self.squeezelite_player.display_name,
+            self._cold_lead_ms,
+            updated,
+            start_delta_ms,
+        )
+        self._cold_lead_ms = updated
+        if abs(updated - self._persisted_lead_ms) < _LEAD_PERSIST_MIN_MS:
+            return
+        self._persisted_lead_ms = updated
+        self.mass.config.set_raw_player_config_value(
+            self.squeezelite_player.player_id, CONF_SENDSPIN_BRIDGE_LEAD, updated
+        )
 
     def _log_stream_summary(self) -> None:
         """Log how many drift corrections the stream that just ended used."""
@@ -642,6 +738,8 @@ class SendspinSqueezeliteBridge:
         offset_ms = (device_pos_s - sendspin_pos_s) * 1000
         play_point = client.play_point
         start_delta_ms = (play_point[1] - audible_unix) * 1000 if play_point is not None else None
+        if start_delta_ms is not None:
+            self._last_start_delta_ms = start_delta_ms
         self.logger.debug(
             "Bridge sync %s: offset=%.0f ms (device=%.3fs sendspin=%.3fs) start_delta=%s state=%s",
             self.squeezelite_player.display_name,
