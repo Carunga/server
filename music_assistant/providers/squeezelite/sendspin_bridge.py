@@ -29,6 +29,7 @@ from aiosendspin.models.core import ClientHelloPayload
 from aiosendspin.models.core import DeviceInfo as SendspinDeviceInfo
 from aiosendspin.models.player import ClientHelloPlayerSupport, SupportedAudioFormat
 from aiosendspin.models.types import AudioCodec, PlayerCommand
+from aioslimproto.models import PlayerState as SlimPlayerState
 from music_assistant_models.enums import IdentifierType
 
 from music_assistant.helpers.util import is_valid_mac_address
@@ -47,6 +48,7 @@ from .constants import CONF_SENDSPIN_BRIDGE, DEFAULT_PLAYER_VOLUME
 if TYPE_CHECKING:
     from aiosendspin.server import ExternalStreamStartRequest, SendspinClient, SendspinServer
     from aiosendspin.server.roles import AudioChunk
+    from aioslimproto.client import SlimClient
 
     from music_assistant.models.player import Player
 
@@ -88,6 +90,17 @@ _PCM_QUEUE_MAX_CHUNKS: int = 512
 
 # Cap on the diagnostic chunk history kept per bridge.
 _CHUNK_HISTORY = 64
+
+# Drift correction (Phase 3). The device position (from its own elapsed report)
+# is compared to the Sendspin timeline; outside the deadband the difference is
+# corrected with a skip/pause. The device may start up to ~1 s early because the
+# Radio starts on buffer-ready rather than honouring the scheduled unpause, so
+# the loop also pulls the initial offset in.
+_SYNC_DEADBAND_MS: int = 120
+_SYNC_MAX_CORRECTION_MS: int = 2000
+_SYNC_MIN_INTERVAL_S: float = 1.5
+_SYNC_START_GRACE_S: float = 3.0
+_SYNC_MONITOR_INTERVAL_S: float = 0.5
 
 
 def sendspin_audible_unix(audible_instant_us: int, sendspin_now_us: int, unix_now: float) -> float:
@@ -168,6 +181,10 @@ class SendspinSqueezeliteBridge:
         self._first_chunk_timestamp_us: int | None = None
         # Unix instant the first buffered sample must be audible (start anchor).
         self._first_chunk_audible_unix: float | None = None
+        # Phase 3 drift correction: periodic position comparison + skip/pause.
+        self._monitor_task: asyncio.Task[None] | None = None
+        self._stream_started_at: float = 0.0
+        self._last_correction_at: float = 0.0
 
     @property
     def is_registered(self) -> bool:
@@ -276,6 +293,7 @@ class SendspinSqueezeliteBridge:
         self._first_chunk_timestamp_us = None
         self._first_chunk_audible_unix = None
         self._chunks.clear()
+        self._stop_monitor()
         self.squeezelite_player.end_sendspin_bridge_playback()
         if self._player_start_task and not self._player_start_task.done():
             self._player_start_task.cancel()
@@ -376,6 +394,9 @@ class SendspinSqueezeliteBridge:
         self._player_started = False
         self._first_chunk_timestamp_us = None
         self._first_chunk_audible_unix = None
+        self._stream_started_at = time.time()
+        self._last_correction_at = 0.0
+        self._start_monitor()
         self.logger.debug(
             "Sendspin stream started for %s; awaiting first chunk",
             self.squeezelite_player.display_name,
@@ -416,6 +437,7 @@ class SendspinSqueezeliteBridge:
         self._player_started = False
         self._first_chunk_audible_unix = None
         self._chunks.clear()
+        self._stop_monitor()
         self.squeezelite_player.end_sendspin_bridge_playback()
         self._signal_pcm_end()
         self.logger.debug("Sendspin stream ended for %s", self.squeezelite_player.display_name)
@@ -426,6 +448,7 @@ class SendspinSqueezeliteBridge:
         self._player_started = False
         self._first_chunk_audible_unix = None
         self._chunks.clear()
+        self._stop_monitor()
         self.squeezelite_player.end_sendspin_bridge_playback()
         self._signal_pcm_end()
         self.mass.create_task(self.squeezelite_player.client.stop())
@@ -503,6 +526,80 @@ class SendspinSqueezeliteBridge:
                 self._pcm_queue.get_nowait()
         with suppress(asyncio.QueueFull):
             self._pcm_queue.put_nowait(None)
+
+    def _start_monitor(self) -> None:
+        """Start the drift-correction/diagnostics loop for the current stream."""
+        self._stop_monitor()
+        self._monitor_task = self.mass.create_task(self._monitor_loop())
+
+    def _stop_monitor(self) -> None:
+        """Stop the drift-correction/diagnostics loop."""
+        if self._monitor_task and not self._monitor_task.done():
+            self._monitor_task.cancel()
+        self._monitor_task = None
+
+    async def _monitor_loop(self) -> None:
+        """Compare the device position to the Sendspin timeline and correct it."""
+        while self._is_streaming:
+            await asyncio.sleep(_SYNC_MONITOR_INTERVAL_S)
+            if not self._is_streaming:
+                break
+            try:
+                self._log_and_correct()
+            except Exception:
+                self.logger.debug("Drift monitor error", exc_info=True)
+
+    def _log_and_correct(self) -> None:
+        """Log the current offset from the Sendspin timeline and correct it."""
+        client = self.squeezelite_player.client
+        audible_unix = self._first_chunk_audible_unix
+        if audible_unix is None:
+            return
+        now = time.time()
+        sendspin_pos_s = now - audible_unix
+        device_pos_s = client.elapsed_milliseconds / 1000
+        offset_ms = (device_pos_s - sendspin_pos_s) * 1000
+        play_point = client.play_point
+        start_delta_ms = (play_point[1] - audible_unix) * 1000 if play_point is not None else None
+        self.logger.debug(
+            "Bridge sync %s: offset=%.0f ms (device=%.3fs sendspin=%.3fs) start_delta=%s state=%s",
+            self.squeezelite_player.display_name,
+            offset_ms,
+            device_pos_s,
+            sendspin_pos_s,
+            f"{start_delta_ms:.0f}ms" if start_delta_ms is not None else "n/a",
+            client.state,
+        )
+        if not self._should_correct(now, client):
+            return
+        if abs(offset_ms) <= _SYNC_DEADBAND_MS:
+            return
+        correction_ms = max(-_SYNC_MAX_CORRECTION_MS, min(_SYNC_MAX_CORRECTION_MS, int(offset_ms)))
+        self._last_correction_at = now
+        if correction_ms > 0:
+            # device is ahead of the timeline - hold it back
+            self.logger.debug(
+                "Bridge sync: pausing %s for %d ms",
+                self.squeezelite_player.display_name,
+                correction_ms,
+            )
+            self.mass.create_task(client.pause_for(correction_ms))
+        else:
+            # device is behind the timeline - jump it forward
+            self.logger.debug(
+                "Bridge sync: skipping %s ahead %d ms",
+                self.squeezelite_player.display_name,
+                -correction_ms,
+            )
+            self.mass.create_task(client.skip_over(-correction_ms))
+
+    def _should_correct(self, now: float, client: SlimClient) -> bool:
+        """Return whether a drift correction may run right now."""
+        if client.state != SlimPlayerState.PLAYING:
+            return False
+        if now - self._stream_started_at < _SYNC_START_GRACE_S:
+            return False
+        return now - self._last_correction_at >= _SYNC_MIN_INTERVAL_S
 
 
 class SendspinBridgeManager(SendspinBridgeManagerBase[SendspinSqueezeliteBridge]):
