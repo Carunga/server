@@ -98,13 +98,16 @@ framework in `providers/sendspin/`:
   (`elapsed_milliseconds`) to the Sendspin timeline (`_first_chunk_audible_unix`)
   and logs `Bridge sync … offset=…`.
 - Start alignment comes from the **lead**: `required_lead_time_ms` is tuned
-  (1800 ms cold / 1700 ms warm) so the Radio becomes audible on the Sendspin
-  instant. An earlier 2500 ms lead started it ~1.2 s early, and 1400 ms left it
-  ~450 ms behind.
-- Corrections are **damped** to avoid oscillation: only after a 3 s start grace
-  and two consecutive samples with the same out-of-deadband sign, then a
-  correction of half the offset capped at 300 ms (`pause_for` when ahead,
-  `skip_over` when behind), with a 2.5 s minimum interval.
+  (1750 ms cold / 1650 ms warm) so the Radio becomes audible on the Sendspin
+  instant. An earlier 2500 ms lead started it ~1.2 s early, 1400 ms left it
+  ~450 ms behind and 1800 ms ~55 ms early.
+- Corrections are **damped**: after a 1.5 s start grace and two consecutive
+  samples with the same out-of-deadband sign, the **first** fix takes the whole
+  offset (capped 300 ms) so the start converges in one step, later fixes take
+  half the offset, with a 1.5 s minimum interval.
+- Diagnostics: the stream-end logs report the correction count (`Bridge sync for
+  … used N correction(s)`) and the PCM source logs starvation (`Bridge PCM source
+  starved …`) so controller corrections can be told apart from WiFi underruns.
 - TODO: rate steering (per-player resampling) if a longer run shows drift; tune
   the lead per transport (wired vs WiFi).
 
