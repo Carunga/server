@@ -97,10 +97,16 @@ framework in `providers/sendspin/`:
 - A 500 ms monitor loop compares the device's reported position
   (`elapsed_milliseconds`) to the Sendspin timeline (`_first_chunk_audible_unix`)
   and logs `Bridge sync … offset=…`.
-- Start alignment comes from the **lead**: `required_lead_time_ms` is tuned
-  (1750 ms cold / 1650 ms warm) so the Radio becomes audible on the Sendspin
-  instant. An earlier 2500 ms lead started it ~1.2 s early, 1400 ms left it
-  ~450 ms behind and 1800 ms ~55 ms early.
+- Start alignment comes from the **lead**: `required_lead_time_ms` is reported per
+  transport as **cold** (learned) or **warm** (`learned − 150 ms`, used when a new
+  stream starts within 8 s of the previous one). The bridge **self-calibrates**
+  the cold lead per player from the measured start error
+  (`start_delta = device apparent start − intended audible start`, slope ~1:1,
+  folded in with a 0.7 gain and clamped to 1200–2600 ms). The value is seeded from
+  and persisted to the raw player config key `sendspin_bridge_lead_ms` (stored in
+  `data/settings.json` under `players/<id>/values/`), so it survives restarts and
+  converges within a couple of tracks. History: 2500 ms started the Radio ~1.2 s
+  early, 1400 ms left it ~450 ms behind; learning lands near ~1850 ms.
 - Corrections are **damped**: after a 1.5 s start grace and two consecutive
   samples with the same out-of-deadband sign, the **first** fix takes the whole
   offset (capped 300 ms) so the start converges in one step, later fixes take
@@ -108,8 +114,7 @@ framework in `providers/sendspin/`:
 - Diagnostics: the stream-end logs report the correction count (`Bridge sync for
   … used N correction(s)`) and the PCM source logs starvation (`Bridge PCM source
   starved …`) so controller corrections can be told apart from WiFi underruns.
-- TODO: rate steering (per-player resampling) if a longer run shows drift; tune
-  the lead per transport (wired vs WiFi).
+- TODO: rate steering (per-player resampling) if a longer run shows drift.
 
 **Phase 4 — robustness (TODO)**
 

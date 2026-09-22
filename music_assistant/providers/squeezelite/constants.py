@@ -17,6 +17,9 @@ DEFAULT_SLIMPROTO_PORT = 3483
 CONF_DISPLAY = "display"
 CONF_VISUALIZATION = "visualization"
 CONF_SENDSPIN_BRIDGE = "sendspin_bridge"
+# Learned per-player lead (ms) for the Sendspin bridge, stored as a raw player
+# config value and adjusted from the measured start error (see sendspin_bridge).
+CONF_SENDSPIN_BRIDGE_LEAD = "sendspin_bridge_lead_ms"
 
 DEFAULT_PLAYER_VOLUME = 20
 DEFAULT_VISUALIZATION = SlimVisualisationType.NONE
