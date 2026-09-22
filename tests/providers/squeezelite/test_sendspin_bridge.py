@@ -11,6 +11,8 @@ from music_assistant.providers.squeezelite.sendspin_bridge import (
     BRIDGE_PCM_CONTENT_TYPE,
     SendspinSqueezeliteBridge,
     get_bridge_client_id,
+    learn_lead_ms,
+    resolve_lead_ms,
     sendspin_audible_unix,
 )
 
@@ -19,7 +21,10 @@ _INVALID_ID = "not-a-mac"
 
 
 def _make_bridge(player_id: str) -> SendspinSqueezeliteBridge:
-    provider = SimpleNamespace(mass=object(), logger=logging.getLogger("test"))
+    mass = SimpleNamespace(
+        config=SimpleNamespace(get_raw_player_config_value=lambda _pid, _key, default=None: default)
+    )
+    provider = SimpleNamespace(mass=mass, logger=logging.getLogger("test"))
     player = SimpleNamespace(player_id=player_id, display_name=player_id)
     return SendspinSqueezeliteBridge(provider, player, sendspin_server=object())
 
@@ -27,6 +32,26 @@ def _make_bridge(player_id: str) -> SendspinSqueezeliteBridge:
 def test_pcm_content_type_reports_the_bridge_format() -> None:
     """The content type carries the rate/channels/depth aioslimproto parses."""
     assert BRIDGE_PCM_CONTENT_TYPE == "audio/pcm;rate=44100;channels=2;bitrate=16"
+
+
+def test_resolve_lead_ms_uses_less_lead_for_a_warm_transport() -> None:
+    """A warm transport needs less lead, never below the floor."""
+    assert resolve_lead_ms(1800, warm=False) == 1800
+    assert resolve_lead_ms(1800, warm=True) == 1650
+    assert resolve_lead_ms(1300, warm=True) == 1200
+
+
+def test_learn_lead_ms_moves_toward_zero_start_error() -> None:
+    """A negative start error (device early) increases the lead, and vice versa."""
+    # device started 108 ms early -> add ~108 ms (full gain)
+    assert learn_lead_ms(1750, -108.0, gain=1.0) == 1858
+    # damped gain only closes 70% of the gap
+    assert learn_lead_ms(1750, -108.0, gain=0.7) == 1826
+    # device started 200 ms late -> reduce the lead
+    assert learn_lead_ms(1800, 200.0, gain=1.0) == 1600
+    # clamped to sane bounds
+    assert learn_lead_ms(1250, 500.0, gain=1.0) == 1200
+    assert learn_lead_ms(2500, -500.0, gain=1.0) == 2600
 
 
 def test_sendspin_audible_unix_transfers_only_the_future_offset() -> None:
