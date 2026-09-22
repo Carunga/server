@@ -11,6 +11,7 @@ from music_assistant.providers.squeezelite.sendspin_bridge import (
     BRIDGE_PCM_CONTENT_TYPE,
     SendspinSqueezeliteBridge,
     get_bridge_client_id,
+    sendspin_audible_unix,
 )
 
 _VALID_MAC = "b8:27:eb:c2:4f:73"
@@ -26,6 +27,14 @@ def _make_bridge(player_id: str) -> SendspinSqueezeliteBridge:
 def test_pcm_content_type_reports_the_bridge_format() -> None:
     """The content type carries the rate/channels/depth aioslimproto parses."""
     assert BRIDGE_PCM_CONTENT_TYPE == "audio/pcm;rate=44100;channels=2;bitrate=16"
+
+
+def test_sendspin_audible_unix_transfers_only_the_future_offset() -> None:
+    """The Sendspin instant maps to unix using the delta from now, not an epoch."""
+    # first sample is 1.5 s in the future on the Sendspin clock
+    assert sendspin_audible_unix(1_500_000, 0, 1000.0) == 1001.5
+    # already-past instant maps to a unix time before now
+    assert sendspin_audible_unix(500_000, 1_000_000, 1000.0) == 999.5
 
 
 def test_bridge_client_id_uses_the_mac_only_when_valid() -> None:

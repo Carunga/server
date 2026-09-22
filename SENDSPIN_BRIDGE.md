@@ -78,16 +78,22 @@ framework in `providers/sendspin/`:
   → `SendspinSqueezeliteBridge.serve_pcm_stream`). The bridge fills a bounded
   `asyncio.Queue` from `BridgePlayerRole.on_audio_chunk`; the HTTP source drains
   it and advertises `audio/pcm;rate=44100;channels=2;bitrate=16`, which
-  aioslimproto turns into the SlimProto codec message.
-- The first chunk starts the SlimProto transport (`play_url` on the bridge URL),
-  so the device's HTTP fetch always has audio to pull.
+  aioslimproto turns into the SlimProto codec message. Each stream gets its own
+  queue so a stale handler can never steal the next stream's chunks.
+- The first chunk starts the SlimProto transport (`play_url` on the bridge URL)
+  with `autostart=False`, so the device buffers but does not start on its own
+  (the player skips its buffer-ready auto-unpause while the bridge owns the
+  start).
+- **Start anchor:** the first chunk's `AudioChunk.timestamp_us` is mapped to a
+  unix instant with `sendspin_audible_unix()`; the transport is then scheduled
+  with `unpause_at(jiffies + delay)` so the first sample becomes audible at the
+  Sendspin instant. This replaces the previous "start when the device buffer
+  fills" behaviour, which played ~1 s early.
 - Backpressure: the queue is bounded; on overflow the oldest chunk is dropped
   (a short gap instead of unbounded latency). Sendspin already paces delivery
   against the group timeline, so no extra client-side pacing is applied yet.
-- Still TODO (finishing Phase 2): anchor the SlimProto start on the Sendspin
-  audible instant (`AudioChunk.timestamp_us` → server time → `jiffies` →
-  `start_at`) instead of relying on the device buffer, and pick the lead/buffer
-  constants from measurement.
+- Still TODO (finishing Phase 2): tune the lead/buffer constants from
+  measurement and verify the anchor on hardware.
 
 **Phase 3 — drift correction (TODO)**
 
