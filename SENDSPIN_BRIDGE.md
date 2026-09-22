@@ -85,8 +85,10 @@ framework in `providers/sendspin/`:
   future `unpause_at`, so a scheduled anchor was tried and dropped.)
 - **Now-playing metadata:** `play_url` is given the Sendspin player's current
   media (title/artist/album/artwork/duration) via `_build_play_metadata()`, so
-  the device shows the real track instead of a placeholder. Per-track updates
-  during the stream are still TODO (needs an aioslimproto now-playing update API).
+  the device shows the real track instead of a placeholder. The monitor loop also
+  pushes **per-track updates** with `SlimClient.update_now_playing()` (added on
+  the aioslimproto fork) when the media changes, so the display/artwork follow
+  the stream.
 - Backpressure: the queue is bounded; on overflow the oldest chunk is dropped
   (a short gap instead of unbounded latency).
 
@@ -96,10 +98,10 @@ framework in `providers/sendspin/`:
   (`elapsed_milliseconds`) to the Sendspin timeline (`_first_chunk_audible_unix`)
   and logs `Bridge sync … offset=…`.
 - Start alignment comes from the **lead**: `required_lead_time_ms` is tuned
-  (1400 ms cold / 1300 ms warm) so the Radio becomes audible on the Sendspin
-  instant. With the earlier 2500 ms lead the device started ~1.2 s early and the
-  loop had to pull it back with an audible pause/skip.
-- Corrections are **damped** to avoid oscillation: only after a 6 s start grace
+  (1800 ms cold / 1700 ms warm) so the Radio becomes audible on the Sendspin
+  instant. An earlier 2500 ms lead started it ~1.2 s early, and 1400 ms left it
+  ~450 ms behind.
+- Corrections are **damped** to avoid oscillation: only after a 3 s start grace
   and two consecutive samples with the same out-of-deadband sign, then a
   correction of half the offset capped at 300 ms (`pause_for` when ahead,
   `skip_over` when behind), with a 2.5 s minimum interval.

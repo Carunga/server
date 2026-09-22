@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from aiosendspin.server import ExternalStreamStartRequest, SendspinClient, SendspinServer
     from aiosendspin.server.roles import AudioChunk
     from aioslimproto.client import SlimClient
+    from music_assistant_models.media_items import PlayerMedia
 
     from music_assistant.models.player import Player
 
@@ -63,8 +64,8 @@ if TYPE_CHECKING:
 # audible on the Sendspin instant: the device starts ~1.3 s after it begins
 # buffering, so a 2500 ms lead started it ~1.2 s early and the drift loop had to
 # pull it back. Keep it above the device's buffer fill time or it underruns.
-SLIM_BRIDGE_COLD_START_LEAD_MS: int = 1400
-SLIM_BRIDGE_WARM_START_LEAD_MS: int = 1300
+SLIM_BRIDGE_COLD_START_LEAD_MS: int = 1800
+SLIM_BRIDGE_WARM_START_LEAD_MS: int = 1700
 
 # Ongoing buffer (ms) Sendspin keeps the bridge supplied with for the whole
 # stream, so the device's ring stays fed without charging every other group
@@ -102,7 +103,7 @@ _SYNC_DEADBAND_MS: int = 120
 _SYNC_MAX_CORRECTION_MS: int = 300
 _SYNC_CORRECTION_GAIN: float = 0.5
 _SYNC_MIN_INTERVAL_S: float = 2.5
-_SYNC_START_GRACE_S: float = 6.0
+_SYNC_START_GRACE_S: float = 3.0
 _SYNC_MONITOR_INTERVAL_S: float = 0.5
 _SYNC_STABLE_SAMPLES: int = 2
 
@@ -193,6 +194,9 @@ class SendspinSqueezeliteBridge:
         # startup transient is not mistaken for real drift.
         self._offset_sign: int = 0
         self._offset_sign_run: int = 0
+        # Signature of the now-playing media last pushed to the device, so the
+        # monitor loop only updates the display on an actual track change.
+        self._last_now_playing: tuple[object, ...] | None = None
 
     @property
     def is_registered(self) -> bool:
@@ -405,6 +409,7 @@ class SendspinSqueezeliteBridge:
         self._last_correction_at = 0.0
         self._offset_sign = 0
         self._offset_sign_run = 0
+        self._last_now_playing = None
         self._start_monitor()
         self.logger.debug(
             "Sendspin stream started for %s; awaiting first chunk",
@@ -498,20 +503,27 @@ class SendspinSqueezeliteBridge:
             )
 
     def _build_play_metadata(self) -> dict[str, object]:
-        """
-        Build the now-playing metadata for the bridge stream from the Sendspin player.
+        """Build the now-playing metadata for the bridge stream from the Sendspin player."""
+        media = self._current_sendspin_media()
+        if media is None:
+            return {"item_id": "sendspin-bridge", "title": self.squeezelite_player.display_name}
+        return self._media_metadata(media)
 
-        The derived Sendspin player carries the group's current media (a synced
-        follower references the leader's), so the device shows the real title,
-        artist, album and artwork instead of a placeholder.
+    def _current_sendspin_media(self) -> PlayerMedia | None:
         """
-        media = None
+        Return the group's current media via the derived Sendspin player.
+
+        A synced follower (which the bridge is) references the leader's media, so
+        this carries the real title/artist/album/artwork even for a follower.
+        """
         if self._bridge_client_id and (
             player := self.mass.players.get_player(self._bridge_client_id)
         ):
-            media = player.current_media
-        if media is None:
-            return {"item_id": "sendspin-bridge", "title": self.squeezelite_player.display_name}
+            return player.current_media
+        return None
+
+    def _media_metadata(self, media: PlayerMedia) -> dict[str, object]:
+        """Build the SlimProto now-playing metadata dict from a Sendspin media item."""
         return {
             "item_id": media.uri or "sendspin-bridge",
             "title": media.title,
@@ -520,6 +532,25 @@ class SendspinSqueezeliteBridge:
             "image_url": media.image_url,
             "duration": media.stream_duration or media.duration,
         }
+
+    def _maybe_update_now_playing(self) -> None:
+        """Push a per-track metadata update to the device when the media changed."""
+        media = self._current_sendspin_media()
+        if media is None:
+            return
+        signature: tuple[object, ...] = (
+            media.queue_item_id or media.uri,
+            media.title,
+            media.artist,
+            media.album,
+            media.image_url,
+        )
+        if signature == self._last_now_playing:
+            return
+        self._last_now_playing = signature
+        self.mass.create_task(
+            self.squeezelite_player.client.update_now_playing(self._media_metadata(media))
+        )
 
     def _enqueue_pcm(self, data: bytes) -> None:
         """Queue a PCM chunk, dropping the oldest when the buffer is full."""
@@ -555,6 +586,7 @@ class SendspinSqueezeliteBridge:
             if not self._is_streaming:
                 break
             try:
+                self._maybe_update_now_playing()
                 self._log_and_correct()
             except Exception:
                 self.logger.debug("Drift monitor error", exc_info=True)
