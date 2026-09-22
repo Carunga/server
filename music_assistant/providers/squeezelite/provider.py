@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -14,7 +15,12 @@ from music_assistant_models.config_entries import ConfigEntry
 from music_assistant_models.enums import ConfigEntryType, MediaType
 from music_assistant_models.errors import SetupFailedError
 
-from music_assistant.constants import CONF_PORT, CONF_SYNC_ADJUST, VERBOSE_LOG_LEVEL
+from music_assistant.constants import (
+    CONF_LOG_LEVEL,
+    CONF_PORT,
+    CONF_SYNC_ADJUST,
+    VERBOSE_LOG_LEVEL,
+)
 from music_assistant.helpers.audio import get_mime_type
 from music_assistant.helpers.util import is_port_in_use
 from music_assistant.models.player_provider import PlayerProvider
@@ -34,6 +40,34 @@ from .sendspin_bridge import SendspinBridgeManager
 if TYPE_CHECKING:
     from aioslimproto.cli import SlimCLICommand
     from aioslimproto.client import SlimClient
+    from music_assistant_models.config_entries import ProviderConfig
+
+
+# How long a provider (re)load keeps retrying the port check before it gives up.
+# A config-triggered reload swaps the provider in place, and the previous
+# instance's sockets (notably the telnet/JSON CLI ports) can still be bound for a
+# moment; retrying avoids failing the load and stranding every player.
+_PORT_VALIDATE_ATTEMPTS: int = 5
+_PORT_VALIDATE_RETRY_DELAY_S: float = 0.5
+
+
+def is_bridge_only_config_change(changed_keys: set[str]) -> bool:
+    """
+    Return whether the config change only toggles the Sendspin bridge option.
+
+    Such a change is applied in place (the bridge manager reconciles) instead of
+    reloading the provider, because a reload stops the SlimProto server and drops
+    every player.
+
+    :param changed_keys: The changed config keys (``values/<key>`` form).
+    """
+    value_keys = {
+        key
+        for key in changed_keys
+        if key.startswith("values/") and key != f"values/{CONF_LOG_LEVEL}"
+    }
+    return bool(value_keys) and value_keys <= {f"values/{CONF_SENDSPIN_BRIDGE}"}
+
 
 # white on transparent logo served for the Home Assistant home-menu entry
 HA_LOGO_PATH = Path(__file__).parent / "ha_logo.png"
@@ -176,6 +210,27 @@ class SqueezelitePlayerProvider(PlayerProvider):
         """Return the player's queue page for the SqueezePlay playlist window."""
         return await self._library_menu.build_playlist_page(player_id, offset, limit)
 
+    async def update_config(self, config: ProviderConfig, changed_keys: set[str]) -> None:
+        """
+        Apply a provider config change.
+
+        Toggling only the Sendspin bridge option is applied in place by
+        reconciling the bridges; a provider reload would stop the SlimProto
+        server and drop every player (and can race its own port check). Any other
+        value change keeps the default reload.
+
+        :param config: The updated provider config.
+        :param changed_keys: The changed config keys.
+        """
+        if is_bridge_only_config_change(changed_keys):
+            self.config = config
+            if f"values/{CONF_LOG_LEVEL}" in changed_keys:
+                self._set_log_level_from_config(config)
+            for player in self.players:
+                await self._bridge_manager.evaluate_bridge(player)
+            return
+        await super().update_config(config, changed_keys)
+
     async def loaded_in_mass(self) -> None:
         """Call after the provider has been loaded."""
         await super().loaded_in_mass()
@@ -233,19 +288,27 @@ class SqueezelitePlayerProvider(PlayerProvider):
         if json_port and json_port > 0:
             ports_to_check.append((json_port, "JSON-RPC CLI"))
 
-        # Collect all port conflicts before raising any errors
-        occupied_ports = []
-        for port, port_description in ports_to_check:
-            if await is_port_in_use(port):
-                occupied_ports.append(f"{port_description} port {port}")
+        # Collect all port conflicts before raising any errors. A config-triggered
+        # reload replaces the provider in place, so the previous instance's
+        # sockets can still be bound for a moment; retry briefly before failing.
+        occupied_ports: list[str] = []
+        for attempt in range(_PORT_VALIDATE_ATTEMPTS):
+            occupied_ports = [
+                f"{port_description} port {port}"
+                for port, port_description in ports_to_check
+                if await is_port_in_use(port)
+            ]
+            if not occupied_ports:
+                return
+            if attempt < _PORT_VALIDATE_ATTEMPTS - 1:
+                await asyncio.sleep(_PORT_VALIDATE_RETRY_DELAY_S)
 
         # If any ports are occupied, raise a comprehensive error message
-        if occupied_ports:
-            if len(occupied_ports) == 1:
-                msg = f"{occupied_ports[0]} is not available"
-            else:
-                msg = f"Multiple ports are not available: {', '.join(occupied_ports)}"
-            raise SetupFailedError(msg)
+        if len(occupied_ports) == 1:
+            msg = f"{occupied_ports[0]} is not available"
+        else:
+            msg = f"Multiple ports are not available: {', '.join(occupied_ports)}"
+        raise SetupFailedError(msg)
 
     async def _cleanup_server(self) -> None:
         """Ensure complete cleanup of the SlimProto server on initialization failure."""
