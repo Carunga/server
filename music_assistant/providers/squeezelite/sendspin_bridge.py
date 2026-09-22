@@ -5,11 +5,12 @@ Registers a Squeezelite (slimproto) player as an external Sendspin client so it
 can take part in Sendspin synchronized playback, with Sendspin as the timing
 master and the SlimProto device as the output.
 
-Status: Phase 2 in progress. Registration, protocol linking, lifecycle, volume/mute
+Status: Phase 2/3 in progress. Registration, protocol linking, lifecycle, volume/mute
 wiring (Phase 1) and the PCM audio path (a bounded queue behind the provider's
-``/slimproto/sendspin`` route) are in place. The device is started paused and
-unpaused at the Sendspin audible instant (``sendspin_audible_unix`` + jiffies
-``unpause_at``). Drift correction is still TODO; see ``SENDSPIN_BRIDGE.md``.
+``/slimproto/sendspin`` route) are in place. The device starts as soon as it is
+buffered; a monitor loop compares its position to the Sendspin timeline and
+corrects drift with skip/pause. The now-playing metadata (title/artist/album/
+artwork) is taken from the Sendspin player so the device shows the real track.
 
 Precision: SlimProto is a method-2 (server-corrected) protocol with no frame
 timestamps and no client-side scheduling, so this bridge can only ever be
@@ -294,7 +295,6 @@ class SendspinSqueezeliteBridge:
         self._first_chunk_audible_unix = None
         self._chunks.clear()
         self._stop_monitor()
-        self.squeezelite_player.end_sendspin_bridge_playback()
         if self._player_start_task and not self._player_start_task.done():
             self._player_start_task.cancel()
         self._player_start_task = None
@@ -438,7 +438,6 @@ class SendspinSqueezeliteBridge:
         self._first_chunk_audible_unix = None
         self._chunks.clear()
         self._stop_monitor()
-        self.squeezelite_player.end_sendspin_bridge_playback()
         self._signal_pcm_end()
         self.logger.debug("Sendspin stream ended for %s", self.squeezelite_player.display_name)
 
@@ -449,7 +448,6 @@ class SendspinSqueezeliteBridge:
         self._first_chunk_audible_unix = None
         self._chunks.clear()
         self._stop_monitor()
-        self.squeezelite_player.end_sendspin_bridge_playback()
         self._signal_pcm_end()
         self.mass.create_task(self.squeezelite_player.client.stop())
         self.logger.debug("Sendspin explicit stop for %s", self.squeezelite_player.display_name)
@@ -459,9 +457,6 @@ class SendspinSqueezeliteBridge:
         if self._player_started:
             return
         self._player_started = True
-        # The bridge anchors the start itself, so the player must not auto-unpause
-        # on buffer ready (see SqueezelitePlayer._handle_buffer_ready).
-        self.squeezelite_player.begin_sendspin_bridge_playback()
         url = (
             f"{self.mass.streams.base_url}/slimproto/sendspin"
             f"?player_id={self.squeezelite_player.player_id}"
@@ -474,14 +469,15 @@ class SendspinSqueezeliteBridge:
         self._player_start_task = self.mass.create_task(self._play_bridge_url(url))
 
     async def _play_bridge_url(self, url: str) -> None:
-        """Point the SlimProto player at the bridge PCM source, then anchor the start."""
+        """Point the SlimProto player at the bridge PCM source and start it."""
         try:
             await self.squeezelite_player.client.play_url(
                 url=url,
                 mime_type=BRIDGE_PCM_CONTENT_TYPE,
-                metadata={"item_id": "sendspin-bridge", "title": "Sendspin"},
-                # buffer only; the bridge unpauses at the Sendspin audible instant
-                autostart=False,
+                metadata=self._build_play_metadata(),
+                # start as soon as the device is buffered; the monitor loop
+                # corrects any start offset (the Radio ignores a future unpause)
+                autostart=True,
                 stream_threshold=_BRIDGE_STREAM_THRESHOLD_KB,
                 output_threshold=_BRIDGE_OUTPUT_THRESHOLD_TENTHS,
             )
@@ -491,25 +487,30 @@ class SendspinSqueezeliteBridge:
                 self.squeezelite_player.display_name,
                 exc_info=True,
             )
-            self.squeezelite_player.end_sendspin_bridge_playback()
-            return
-        await self._anchor_start()
 
-    async def _anchor_start(self) -> None:
-        """Unpause the buffered device so its first sample lands on the Sendspin instant."""
-        client = self.squeezelite_player.client
-        audible_unix = self._first_chunk_audible_unix
-        if audible_unix is None:
-            await client.unpause_at(client.jiffies)
-            return
-        delay_ms = int((audible_unix - time.time()) * 1000)
-        self.logger.debug(
-            "Anchoring bridge start for %s in %d ms",
-            self.squeezelite_player.display_name,
-            delay_ms,
-        )
-        # jiffies run at 1 kHz, so milliseconds map 1:1 onto the player clock
-        await client.unpause_at(client.jiffies + max(0, delay_ms))
+    def _build_play_metadata(self) -> dict[str, object]:
+        """
+        Build the now-playing metadata for the bridge stream from the Sendspin player.
+
+        The derived Sendspin player carries the group's current media (a synced
+        follower references the leader's), so the device shows the real title,
+        artist, album and artwork instead of a placeholder.
+        """
+        media = None
+        if self._bridge_client_id and (
+            player := self.mass.players.get_player(self._bridge_client_id)
+        ):
+            media = player.current_media
+        if media is None:
+            return {"item_id": "sendspin-bridge", "title": self.squeezelite_player.display_name}
+        return {
+            "item_id": media.uri or "sendspin-bridge",
+            "title": media.title,
+            "artist": media.artist,
+            "album": media.album,
+            "image_url": media.image_url,
+            "duration": media.stream_duration or media.duration,
+        }
 
     def _enqueue_pcm(self, data: bytes) -> None:
         """Queue a PCM chunk, dropping the oldest when the buffer is full."""
