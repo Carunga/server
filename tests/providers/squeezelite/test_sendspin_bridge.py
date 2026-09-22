@@ -114,3 +114,40 @@ async def test_signal_pcm_end_pushes_the_sentinel() -> None:
     bridge._signal_pcm_end()
 
     assert bridge._pcm_queue.get_nowait() is None
+
+
+async def test_maybe_update_now_playing_pushes_once_per_track() -> None:
+    """A track change pushes metadata once; identical media is not re-pushed."""
+    bridge = _make_bridge(_VALID_MAC)
+    bridge._bridge_client_id = "spb_x"
+    media = SimpleNamespace(
+        queue_item_id="q1",
+        uri="library://track/1",
+        title="Title",
+        artist="Artist",
+        album="Album",
+        image_url="http://host/art.png",
+        duration=1,
+        stream_duration=None,
+    )
+    calls: list[dict[str, object]] = []
+
+    class _Client:
+        async def update_now_playing(self, metadata: dict[str, object]) -> None:
+            calls.append(metadata)
+
+    bridge.squeezelite_player = SimpleNamespace(
+        player_id=_VALID_MAC, display_name="x", client=_Client()
+    )
+    bridge.mass = SimpleNamespace(
+        players=SimpleNamespace(get_player=lambda _pid: SimpleNamespace(current_media=media)),
+        create_task=asyncio.ensure_future,
+    )
+
+    bridge._maybe_update_now_playing()
+    await asyncio.sleep(0)
+    bridge._maybe_update_now_playing()
+    await asyncio.sleep(0)
+
+    assert len(calls) == 1
+    assert calls[0]["title"] == "Title"
