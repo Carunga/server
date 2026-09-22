@@ -7,9 +7,9 @@ master and the SlimProto device as the output.
 
 Status: Phase 2 in progress. Registration, protocol linking, lifecycle, volume/mute
 wiring (Phase 1) and the PCM audio path (a bounded queue behind the provider's
-``/slimproto/sendspin`` route, started on the first chunk) are in place. Precise
-start anchoring on the Sendspin timeline and drift correction are still TODO; see
-``SENDSPIN_BRIDGE.md`` for the remaining phases.
+``/slimproto/sendspin`` route) are in place. The device is started paused and
+unpaused at the Sendspin audible instant (``sendspin_audible_unix`` + jiffies
+``unpause_at``). Drift correction is still TODO; see ``SENDSPIN_BRIDGE.md``.
 
 Precision: SlimProto is a method-2 (server-corrected) protocol with no frame
 timestamps and no client-side scheduling, so this bridge can only ever be
@@ -19,6 +19,7 @@ near-synced (single-digit to tens of milliseconds), never sample-accurate.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import deque
 from contextlib import suppress
 from typing import TYPE_CHECKING, cast
@@ -89,6 +90,25 @@ _PCM_QUEUE_MAX_CHUNKS: int = 512
 _CHUNK_HISTORY = 64
 
 
+def sendspin_audible_unix(audible_instant_us: int, sendspin_now_us: int, unix_now: float) -> float:
+    """
+    Map a Sendspin-clock audible instant to a unix epoch (seconds).
+
+    Sendspin schedules playback on its own clock (``sendspin_server.clock.now_us()``)
+    while the SlimProto start is timed on the server's wall clock. The two clocks
+    share no epoch, so only the offset from now transfers: take how far
+    ``audible_instant_us`` sits in the future on the Sendspin clock and apply that
+    delta to a unix reading captured at the same instant. ``sendspin_now_us`` and
+    ``unix_now`` must be sampled back to back.
+
+    :param audible_instant_us: Sendspin-clock instant the first sample must be audible.
+    :param sendspin_now_us: ``sendspin_server.clock.now_us()`` captured now.
+    :param unix_now: ``time.time()`` captured at the same instant.
+    :return: The unix epoch second that coincides with ``audible_instant_us``.
+    """
+    return unix_now + (audible_instant_us - sendspin_now_us) / 1_000_000
+
+
 def get_bridge_client_id(squeezelite_player: SqueezelitePlayer) -> str | None:
     """
     Get the Sendspin bridge client ID for a Squeezelite player.
@@ -146,6 +166,8 @@ class SendspinSqueezeliteBridge:
         self._player_started = False
         self._player_start_task: asyncio.Task[None] | None = None
         self._first_chunk_timestamp_us: int | None = None
+        # Unix instant the first buffered sample must be audible (start anchor).
+        self._first_chunk_audible_unix: float | None = None
 
     @property
     def is_registered(self) -> bool:
@@ -252,7 +274,9 @@ class SendspinSqueezeliteBridge:
         self._is_streaming = False
         self._player_started = False
         self._first_chunk_timestamp_us = None
+        self._first_chunk_audible_unix = None
         self._chunks.clear()
+        self.squeezelite_player.end_sendspin_bridge_playback()
         if self._player_start_task and not self._player_start_task.done():
             self._player_start_task.cancel()
         self._player_start_task = None
@@ -290,15 +314,19 @@ class SendspinSqueezeliteBridge:
         if request.method != "GET":
             return resp
 
+        # Capture this stream's queue and generation so a later stream can never
+        # feed this handler (and vice versa).
+        queue = self._pcm_queue
         generation = self._stream_generation
         self.logger.debug("Serving bridge PCM to %s", self.squeezelite_player.display_name)
         while generation == self._stream_generation:
-            chunk = await self._pcm_queue.get()
+            chunk = await queue.get()
             if chunk is None:
                 break
             try:
                 await resp.write(chunk)
-            except ConnectionResetError, RuntimeError:
+            except ConnectionError, RuntimeError:
+                # aioslimproto closed its fetch (stream restart/stop) - not an error
                 break
         with suppress(Exception):
             await resp.write_eof()
@@ -340,12 +368,14 @@ class SendspinSqueezeliteBridge:
 
     def _on_bridge_stream_start(self) -> None:
         """Handle the PushStream actually starting to deliver audio."""
-        # Start a fresh stream generation so a stale HTTP handler cannot feed the
-        # device from the previous one.
+        # Bump the generation and release the previous queue so a stale HTTP
+        # handler can neither feed from nor steal chunks of the new stream.
         self._stream_generation += 1
-        self._drain_pcm_queue()
+        self._signal_pcm_end()
+        self._pcm_queue = asyncio.Queue()
         self._player_started = False
         self._first_chunk_timestamp_us = None
+        self._first_chunk_audible_unix = None
         self.logger.debug(
             "Sendspin stream started for %s; awaiting first chunk",
             self.squeezelite_player.display_name,
@@ -355,15 +385,20 @@ class SendspinSqueezeliteBridge:
         """
         Receive a timestamped audio chunk from Sendspin.
 
-        The first chunk starts the SlimProto transport, which fetches the PCM
-        source; the remaining chunks are queued for that fetch. ``chunk.timestamp_us``
-        is retained for the Phase 3 drift correction.
+        The first chunk anchors the SlimProto start on the Sendspin timeline and
+        starts the transport, which fetches the PCM source; the remaining chunks
+        are queued for that fetch.
         """
         if not self._is_streaming:
             return
         self._chunks.append(chunk)
         if self._first_chunk_timestamp_us is None:
             self._first_chunk_timestamp_us = chunk.timestamp_us
+            sendspin_now_us = self.sendspin_server.clock.now_us()
+            unix_now = time.time()
+            self._first_chunk_audible_unix = sendspin_audible_unix(
+                chunk.timestamp_us, sendspin_now_us, unix_now
+            )
             self._start_player_stream()
         self._enqueue_pcm(chunk.data)
 
@@ -379,7 +414,9 @@ class SendspinSqueezeliteBridge:
         """Handle the Sendspin stream ending."""
         self._is_streaming = False
         self._player_started = False
+        self._first_chunk_audible_unix = None
         self._chunks.clear()
+        self.squeezelite_player.end_sendspin_bridge_playback()
         self._signal_pcm_end()
         self.logger.debug("Sendspin stream ended for %s", self.squeezelite_player.display_name)
 
@@ -387,7 +424,9 @@ class SendspinSqueezeliteBridge:
         """Handle an explicit stop from the Sendspin side."""
         self._is_streaming = False
         self._player_started = False
+        self._first_chunk_audible_unix = None
         self._chunks.clear()
+        self.squeezelite_player.end_sendspin_bridge_playback()
         self._signal_pcm_end()
         self.mass.create_task(self.squeezelite_player.client.stop())
         self.logger.debug("Sendspin explicit stop for %s", self.squeezelite_player.display_name)
@@ -397,6 +436,9 @@ class SendspinSqueezeliteBridge:
         if self._player_started:
             return
         self._player_started = True
+        # The bridge anchors the start itself, so the player must not auto-unpause
+        # on buffer ready (see SqueezelitePlayer._handle_buffer_ready).
+        self.squeezelite_player.begin_sendspin_bridge_playback()
         url = (
             f"{self.mass.streams.base_url}/slimproto/sendspin"
             f"?player_id={self.squeezelite_player.player_id}"
@@ -409,12 +451,14 @@ class SendspinSqueezeliteBridge:
         self._player_start_task = self.mass.create_task(self._play_bridge_url(url))
 
     async def _play_bridge_url(self, url: str) -> None:
-        """Point the SlimProto player at the bridge PCM source."""
+        """Point the SlimProto player at the bridge PCM source, then anchor the start."""
         try:
             await self.squeezelite_player.client.play_url(
                 url=url,
                 mime_type=BRIDGE_PCM_CONTENT_TYPE,
                 metadata={"item_id": "sendspin-bridge", "title": "Sendspin"},
+                # buffer only; the bridge unpauses at the Sendspin audible instant
+                autostart=False,
                 stream_threshold=_BRIDGE_STREAM_THRESHOLD_KB,
                 output_threshold=_BRIDGE_OUTPUT_THRESHOLD_TENTHS,
             )
@@ -424,6 +468,25 @@ class SendspinSqueezeliteBridge:
                 self.squeezelite_player.display_name,
                 exc_info=True,
             )
+            self.squeezelite_player.end_sendspin_bridge_playback()
+            return
+        await self._anchor_start()
+
+    async def _anchor_start(self) -> None:
+        """Unpause the buffered device so its first sample lands on the Sendspin instant."""
+        client = self.squeezelite_player.client
+        audible_unix = self._first_chunk_audible_unix
+        if audible_unix is None:
+            await client.unpause_at(client.jiffies)
+            return
+        delay_ms = int((audible_unix - time.time()) * 1000)
+        self.logger.debug(
+            "Anchoring bridge start for %s in %d ms",
+            self.squeezelite_player.display_name,
+            delay_ms,
+        )
+        # jiffies run at 1 kHz, so milliseconds map 1:1 onto the player clock
+        await client.unpause_at(client.jiffies + max(0, delay_ms))
 
     def _enqueue_pcm(self, data: bytes) -> None:
         """Queue a PCM chunk, dropping the oldest when the buffer is full."""
@@ -440,12 +503,6 @@ class SendspinSqueezeliteBridge:
                 self._pcm_queue.get_nowait()
         with suppress(asyncio.QueueFull):
             self._pcm_queue.put_nowait(None)
-
-    def _drain_pcm_queue(self) -> None:
-        """Discard all buffered PCM from a previous stream."""
-        with suppress(asyncio.QueueEmpty):
-            while True:
-                self._pcm_queue.get_nowait()
 
 
 class SendspinBridgeManager(SendspinBridgeManagerBase[SendspinSqueezeliteBridge]):
