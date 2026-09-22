@@ -71,15 +71,23 @@ framework in `providers/sendspin/`:
 - Import-validated against `aiosendspin==9.1.1` + `music-assistant-models==1.1.212`;
   `ruff check`/`ruff format` clean.
 
-**Phase 2 — audio path (TODO)**
+**Phase 2 — audio path (first cut done)**
 
-- Per-player **PCM HTTP source** served by a provider dynamic route
-  (`/slimproto/sendspin`), a bounded `asyncio.Queue` the bridge fills from
-  `BridgePlayerRole.on_audio_chunk` and the player's HTTP client drains.
-- On stream start: buffer until the first chunk, map
-  `AudioChunk.timestamp_us` → server time → player `jiffies`, then issue the
-  SlimProto start so playback begins at the Sendspin audible instant.
-- `on_audio_chunk` currently only records diagnostic history.
+- Per-player **PCM HTTP source** served by the provider dynamic route
+  `/slimproto/sendspin?player_id=<mac>` (`SqueezelitePlayerProvider._serve_sendspin_stream`
+  → `SendspinSqueezeliteBridge.serve_pcm_stream`). The bridge fills a bounded
+  `asyncio.Queue` from `BridgePlayerRole.on_audio_chunk`; the HTTP source drains
+  it and advertises `audio/pcm;rate=44100;channels=2;bitrate=16`, which
+  aioslimproto turns into the SlimProto codec message.
+- The first chunk starts the SlimProto transport (`play_url` on the bridge URL),
+  so the device's HTTP fetch always has audio to pull.
+- Backpressure: the queue is bounded; on overflow the oldest chunk is dropped
+  (a short gap instead of unbounded latency). Sendspin already paces delivery
+  against the group timeline, so no extra client-side pacing is applied yet.
+- Still TODO (finishing Phase 2): anchor the SlimProto start on the Sendspin
+  audible instant (`AudioChunk.timestamp_us` → server time → `jiffies` →
+  `start_at`) instead of relying on the device buffer, and pick the lead/buffer
+  constants from measurement.
 
 **Phase 3 — drift correction (TODO)**
 
