@@ -13,6 +13,7 @@ from music_assistant.providers.squeezelite.sendspin_bridge import (
     get_bridge_client_id,
     learn_lead_ms,
     resolve_lead_ms,
+    self_heal_due,
     sendspin_audible_unix,
 )
 
@@ -52,6 +53,28 @@ def test_learn_lead_ms_moves_toward_zero_start_error() -> None:
     # clamped to sane bounds
     assert learn_lead_ms(1250, 500.0, gain=1.0) == 1200
     assert learn_lead_ms(2500, -500.0, gain=1.0) == 2600
+
+
+def test_self_heal_due_requires_an_active_stream_and_a_stopped_device() -> None:
+    """Self-heal only when audio flows, the device is stopped, and rate limits allow."""
+    base: dict[str, object] = {
+        "streaming": True,
+        "chunk_age_s": 0.3,
+        "device_stopped": True,
+        "stream_age_s": 10.0,
+        "stopped_age_s": 2.0,
+        "since_last_heal_s": 100.0,
+        "heal_count": 0,
+    }
+    assert self_heal_due(**base) is True
+    assert self_heal_due(**{**base, "streaming": False}) is False
+    assert self_heal_due(**{**base, "device_stopped": False}) is False
+    assert self_heal_due(**{**base, "chunk_age_s": 5.0}) is False
+    assert self_heal_due(**{**base, "stream_age_s": 1.0}) is False
+    assert self_heal_due(**{**base, "stopped_age_s": 0.5}) is False
+    assert self_heal_due(**{**base, "stopped_age_s": None}) is False
+    assert self_heal_due(**{**base, "since_last_heal_s": 1.0}) is False
+    assert self_heal_due(**{**base, "heal_count": 5}) is False
 
 
 def test_sendspin_audible_unix_transfers_only_the_future_offset() -> None:

@@ -122,6 +122,57 @@ _SYNC_START_GRACE_S: float = 1.5
 _SYNC_MONITOR_INTERVAL_S: float = 0.5
 _SYNC_STABLE_SAMPLES: int = 2
 
+# Self-heal: an output-protocol handover (grouping a bridged player) can stop the
+# device by invalidating the native stream session it was fetching; the bridge
+# then has nothing to play on. If the group is still streaming but the device is
+# stopped, re-issue the bridge stream.
+_SELF_HEAL_CHUNK_FRESH_S: float = 2.0
+_SELF_HEAL_START_GRACE_S: float = 4.0
+_SELF_HEAL_DEBOUNCE_S: float = 1.5
+_SELF_HEAL_MIN_INTERVAL_S: float = 5.0
+_SELF_HEAL_MAX_PER_STREAM: int = 5
+
+# A stop that arrives while the group is still delivering audio is treated as a
+# group reconfiguration/handover, not a real user stop, so the device is kept.
+_HANDOVER_STOP_GRACE_S: float = 2.0
+
+
+def self_heal_due(
+    *,
+    streaming: bool,
+    chunk_age_s: float,
+    device_stopped: bool,
+    stream_age_s: float,
+    stopped_age_s: float | None,
+    since_last_heal_s: float,
+    heal_count: int,
+) -> bool:
+    """
+    Return whether the bridge should re-issue its stream because the device stopped.
+
+    Only heals while audio is actually flowing (a fresh chunk), after a start
+    grace and a debounce, rate-limited to avoid loops.
+
+    :param streaming: Whether the bridge currently has an active stream.
+    :param chunk_age_s: Seconds since the last audio chunk arrived.
+    :param device_stopped: Whether the device reports STOPPED.
+    :param stream_age_s: Seconds since the current stream started.
+    :param stopped_age_s: Seconds the device has been stopped, or None if it just stopped.
+    :param since_last_heal_s: Seconds since the last self-heal.
+    :param heal_count: How many self-heals ran for this stream.
+    """
+    if not streaming or chunk_age_s > _SELF_HEAL_CHUNK_FRESH_S:
+        return False
+    if not device_stopped:
+        return False
+    if stream_age_s < _SELF_HEAL_START_GRACE_S:
+        return False
+    if stopped_age_s is None or stopped_age_s < _SELF_HEAL_DEBOUNCE_S:
+        return False
+    if heal_count >= _SELF_HEAL_MAX_PER_STREAM:
+        return False
+    return since_last_heal_s >= _SELF_HEAL_MIN_INTERVAL_S
+
 
 def sendspin_audible_unix(audible_instant_us: int, sendspin_now_us: int, unix_now: float) -> float:
     """
@@ -259,6 +310,11 @@ class SendspinSqueezeliteBridge:
         # monitor loop only updates the display on an actual track change.
         self._last_now_playing: tuple[object, ...] | None = None
         self._corrections_applied: int = 0
+        # Self-heal / handover tracking.
+        self._last_chunk_at: float = 0.0
+        self._stopped_since: float | None = None
+        self._last_self_heal_at: float = 0.0
+        self._self_heal_count: int = 0
 
     @property
     def is_registered(self) -> bool:
@@ -506,6 +562,10 @@ class SendspinSqueezeliteBridge:
         self._offset_sign_run = 0
         self._last_now_playing = None
         self._corrections_applied = 0
+        self._last_chunk_at = 0.0
+        self._stopped_since = None
+        self._last_self_heal_at = 0.0
+        self._self_heal_count = 0
         self._start_monitor()
         self.logger.debug(
             "Sendspin stream started for %s; awaiting first chunk",
@@ -522,6 +582,7 @@ class SendspinSqueezeliteBridge:
         """
         if not self._is_streaming:
             return
+        self._last_chunk_at = time.time()
         self._chunks.append(chunk)
         if self._first_chunk_timestamp_us is None:
             self._first_chunk_timestamp_us = chunk.timestamp_us
@@ -556,6 +617,15 @@ class SendspinSqueezeliteBridge:
 
     def _on_bridge_explicit_stop(self) -> None:
         """Handle an explicit stop from the Sendspin side."""
+        # A stop that arrives while audio is still flowing is a group
+        # reconfiguration / output-protocol handover, not a real user stop: keep
+        # the device on the bridge stream (self-heal re-asserts it if needed).
+        if self._is_streaming and (time.time() - self._last_chunk_at) < _HANDOVER_STOP_GRACE_S:
+            self.logger.debug(
+                "Ignoring transient explicit stop for %s (stream still active)",
+                self.squeezelite_player.display_name,
+            )
+            return
         self._is_streaming = False
         self._player_started = False
         self._first_chunk_audible_unix = None
@@ -620,7 +690,11 @@ class SendspinSqueezeliteBridge:
     async def _play_bridge_url(self, url: str) -> None:
         """Point the SlimProto player at the bridge PCM source and start it."""
         try:
-            await self.squeezelite_player.client.play_url(
+            client = self.squeezelite_player.client
+            # The bridge owns playback now: make sure the device is powered on
+            # before the stream (play_url also does this, this is belt and braces).
+            await client.power(True)
+            await client.play_url(
                 url=url,
                 mime_type=BRIDGE_PCM_CONTENT_TYPE,
                 metadata=self._build_play_metadata(),
@@ -636,6 +710,14 @@ class SendspinSqueezeliteBridge:
                 self.squeezelite_player.display_name,
                 exc_info=True,
             )
+
+    def _restart_player_stream(self) -> None:
+        """Re-issue the bridge stream on the device (self-heal)."""
+        if self._player_start_task and not self._player_start_task.done():
+            self._player_start_task.cancel()
+        self._player_start_task = None
+        self._player_started = False
+        self._start_player_stream()
 
     def _build_play_metadata(self) -> dict[str, object]:
         """Build the now-playing metadata for the bridge stream from the Sendspin player."""
@@ -722,9 +804,39 @@ class SendspinSqueezeliteBridge:
                 break
             try:
                 self._maybe_update_now_playing()
+                self._maybe_self_heal()
                 self._log_and_correct()
             except Exception:
                 self.logger.debug("Drift monitor error", exc_info=True)
+
+    def _maybe_self_heal(self) -> None:
+        """Re-issue the bridge stream if the group is playing but the device stopped."""
+        client = self.squeezelite_player.client
+        now = time.time()
+        device_stopped = client.state == SlimPlayerState.STOPPED
+        if device_stopped and self._is_streaming and self._stopped_since is None:
+            self._stopped_since = now
+        due = self_heal_due(
+            streaming=self._is_streaming,
+            chunk_age_s=now - self._last_chunk_at,
+            device_stopped=device_stopped,
+            stream_age_s=now - self._stream_started_at,
+            stopped_age_s=(now - self._stopped_since) if self._stopped_since else None,
+            since_last_heal_s=now - self._last_self_heal_at,
+            heal_count=self._self_heal_count,
+        )
+        if not device_stopped:
+            self._stopped_since = None
+        if not due:
+            return
+        self._self_heal_count += 1
+        self._last_self_heal_at = now
+        self._stopped_since = None
+        self.logger.info(
+            "Self-healing Sendspin bridge for %s: device stopped while streaming",
+            self.squeezelite_player.display_name,
+        )
+        self._restart_player_stream()
 
     def _log_and_correct(self) -> None:
         """Log the current offset from the Sendspin timeline and correct it."""
