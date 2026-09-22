@@ -90,16 +90,21 @@ framework in `providers/sendspin/`:
 - Backpressure: the queue is bounded; on overflow the oldest chunk is dropped
   (a short gap instead of unbounded latency).
 
-**Phase 3 — drift correction (first cut done)**
+**Phase 3 — drift correction (done, damped)**
 
 - A 500 ms monitor loop compares the device's reported position
   (`elapsed_milliseconds`) to the Sendspin timeline (`_first_chunk_audible_unix`)
-  and logs `Bridge sync … offset=…`. Outside a 120 ms deadband (after a 3 s start
-  grace, 1.5 s minimum interval) it corrects with `pause_for` (device ahead) or
-  `skip_over` (device behind). Measured steady state on the Radio: ~45 ms, no
-  audible difference, no drift over ~20 s.
+  and logs `Bridge sync … offset=…`.
+- Start alignment comes from the **lead**: `required_lead_time_ms` is tuned
+  (1400 ms cold / 1300 ms warm) so the Radio becomes audible on the Sendspin
+  instant. With the earlier 2500 ms lead the device started ~1.2 s early and the
+  loop had to pull it back with an audible pause/skip.
+- Corrections are **damped** to avoid oscillation: only after a 6 s start grace
+  and two consecutive samples with the same out-of-deadband sign, then a
+  correction of half the offset capped at 300 ms (`pause_for` when ahead,
+  `skip_over` when behind), with a 2.5 s minimum interval.
 - TODO: rate steering (per-player resampling) if a longer run shows drift; tune
-  the deadband/gates.
+  the lead per transport (wired vs WiFi).
 
 **Phase 4 — robustness (TODO)**
 
