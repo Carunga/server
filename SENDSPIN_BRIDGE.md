@@ -116,10 +116,19 @@ framework in `providers/sendspin/`:
   starved …`) so controller corrections can be told apart from WiFi underruns.
 - TODO: rate steering (per-player resampling) if a longer run shows drift.
 
-**Phase 4 — robustness (TODO)**
+**Phase 4 — robustness (in progress)**
 
-- Stream end/seek/next, late join, group add/remove, reconnect, leader handoff.
-- Ensure a bridged player is excluded from native SlimProto sync groups.
+- **Self-heal:** a 500 ms monitor check re-issues the bridge stream when the group
+  is still delivering audio but the device reports STOPPED (e.g. after an
+  output-protocol handover invalidated the native stream session the device was
+  fetching). Rate-limited (max 5 per stream, 5 s apart).
+- **Handover-aware stop:** an explicit stop that arrives while audio is still
+  flowing is treated as a group reconfiguration, not a user stop, so the device
+  is kept on the bridge stream.
+- **Power:** the bridge explicitly powers the device on when it starts a stream
+  (the bridge owns playback while active).
+- Still TODO: exclude a bridged player from native SlimProto sync groups; broader
+  stream end/seek/next + reconnect handling.
 
 ## Dependency on the patched aioslimproto
 
