@@ -185,14 +185,29 @@ async def test_push_player_name_publishes_display_name_and_pushes_custom_name() 
     client.set_player_name.assert_awaited_once_with("Küchen Radio")
 
 
-async def test_push_player_name_without_custom_name_only_publishes_device_name() -> None:
-    """Without a custom name only the server-reported name is set, nothing is pushed."""
+async def test_push_player_name_without_custom_name_leaves_display_name_unset() -> None:
+    """
+    Without a custom name, display_name is left unset so it tracks the live device name.
+
+    Publishing the (possibly stale or still-placeholder) device name here instead would
+    have the CLI report it straight back to the device, which a SqueezePlay device then
+    adopts and persists as its own name.
+    """
     player, client = _bare_player(custom_name=None, device_name="Keller-Lautsprecher")
 
     await player._push_player_name()
 
-    assert client.display_name == "Keller-Lautsprecher"
+    assert client.display_name is None
     client.set_player_name.assert_not_awaited()
+
+
+async def test_push_player_name_without_custom_name_does_not_echo_connect_placeholder() -> None:
+    """A connect-time '<type>: <mac>' placeholder name must never be published."""
+    player, client = _bare_player(custom_name=None, device_name="squeezeplay: aa:bb:cc:dd:ee:ff")
+
+    await player._push_player_name()
+
+    assert client.display_name is None
 
 
 async def test_push_player_name_skips_disconnected_client() -> None:

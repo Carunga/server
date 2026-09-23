@@ -445,16 +445,21 @@ class SqueezelitePlayer(Player):
         """
         Publish the Music Assistant player name to the device and to the server.
 
-        The server-reported name (status/players) drives the SqueezePlay settings and
-        status UI, so it is always set. The LMS 'playername' pref is only pushed for a
-        user-configured name that the device does not already report: a squeezelite
-        player echoes the setd frame back as its name, so re-sending an unchanged name
-        would loop forever.
+        Only a user-configured custom name is pushed. Without one, `client.display_name`
+        is left at its default (falls back to the device-reported name): setting it to
+        `self.display_name` unconditionally used to report the device's own name back to
+        it, including the "<type>: <mac>" placeholder still in place right after connect
+        (before the device's HELO/setd name exchange completes) - which a SqueezePlay
+        device (Radio/Touch/Controller) then adopts and persists as its own name.
+
+        The LMS 'playername' pref is only pushed for a user-configured name that the
+        device does not already report: a squeezelite player echoes the setd frame back
+        as its name, so re-sending an unchanged name would loop forever.
         """
         if not self.client.connected:
             return
-        self.client.display_name = self.display_name
         custom_name = self.config.name
+        self.client.display_name = custom_name or None
         if not custom_name or custom_name == self.client.name:
             return
         self.logger.debug("Pushing custom player name %r to device", custom_name)
