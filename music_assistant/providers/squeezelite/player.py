@@ -142,6 +142,15 @@ class SqueezelitePlayer(Player):
         """Set up the player."""
         player_id = self.client.player_id
         self.logger.info("Player %s connected", self.client.name or player_id)
+        # A device that was on reports its power state right after connecting. A device
+        # that cold-boots into standby may stay silent for a while though (observed: no
+        # `power` report for ~2.5 minutes), so we keep the default (off) until it does.
+        # LMS persists a per-player `power` pref and re-applies it on every connect
+        # (Slim/Player/Player.pm::init applies the stored `power` pref).
+        # We deliberately do not persist power: the device state is authoritative and
+        # re-applying stored intent would wake a standby player by itself. If restoring
+        # intent across MA restarts is ever needed, mirror LMS (add a stored value +
+        # migration) and re-apply here.
         # update all dynamic attributes
         self.update_attributes()
         # make the device show the Music Assistant player name
