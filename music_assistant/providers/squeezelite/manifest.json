@@ -8,7 +8,7 @@
   "credits": [
     "[aioslimproto](https://github.com/music-assistant/aioslimproto)"
   ],
-  "requirements": ["aioslimproto @ git+https://github.com/Carunga/aioslimproto@better-squeeze-power-control"],
+  "requirements": ["aioslimproto @ git+https://github.com/Carunga/aioslimproto@better-squeeze-power-mute-controls"],
   "documentation": "https://music-assistant.io/player-support/squeezelite/",
   "multi_instance": false,
   "builtin": false
