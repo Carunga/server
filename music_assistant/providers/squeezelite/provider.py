@@ -68,6 +68,7 @@ def is_bridge_only_config_change(changed_keys: set[str]) -> bool:
     }
     return bool(value_keys) and value_keys <= {f"values/{CONF_SENDSPIN_BRIDGE}"}
 
+
 # white on transparent logo served for the Home Assistant home-menu entry
 HA_LOGO_PATH = Path(__file__).parent / "ha_logo.png"
 
