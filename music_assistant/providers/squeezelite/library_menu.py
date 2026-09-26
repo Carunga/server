@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from music_assistant_models.enums import MediaType, QueueOption
+from music_assistant_models.enums import MediaType, PlayerFeature, QueueOption
 from music_assistant_models.errors import MusicAssistantError
 
 if TYPE_CHECKING:
@@ -108,9 +108,37 @@ class SqueezeliteLibraryMenu:
         if not cmd.kwargs.get("item_id"):
             items = list(result.get("item_loop") or [])
             items.extend(self._home_entries())
+            if (power_item := self._power_item(cmd.player_id)) is not None:
+                items.append(power_item)
             result["item_loop"] = items
             result["count"] = len(items)
         return result
+
+    def _power_item(self, player_id: str) -> dict[str, Any] | None:
+        """
+        Build the home-menu power entry for a player.
+
+        Mirrors LMS ``Slim::Control::Jive::playerPower``, which refreshes this
+        entry on every power change so SqueezePlay can show/enter the power state.
+
+        :param player_id: The player the menu is built for.
+        """
+        player = self.mass.players.get_player(player_id)
+        if player is None or PlayerFeature.POWER not in player.supported_features:
+            return None
+        power = 0 if player.powered else 1
+        text = (
+            f"Turn off {player.display_name}"
+            if player.powered
+            else f"Turn on {player.display_name}"
+        )
+        return {
+            "id": "playerpower",
+            "node": ROOT_NODE,
+            "weight": 100,
+            "text": text,
+            "actions": {"do": {"player": 0, "cmd": ["power", power]}},
+        }
 
     def _home_entries(self) -> list[dict[str, Any]]:
         """Build the library entries and the root-level Home Assistant entry."""
