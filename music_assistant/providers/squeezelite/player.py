@@ -103,6 +103,7 @@ class SqueezelitePlayer(Player):
             PlayerFeature.SET_MEMBERS,
             PlayerFeature.MULTI_DEVICE_DSP,
             PlayerFeature.VOLUME_SET,
+            PlayerFeature.VOLUME_MUTE,
             PlayerFeature.PAUSE,
             PlayerFeature.ENQUEUE,
             PlayerFeature.GAPLESS_PLAYBACK,
